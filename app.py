@@ -2,8 +2,11 @@ import csv
 import json
 import math
 import re
+import smtplib
+import ssl
 import uuid
 from datetime import datetime
+from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
 
@@ -60,6 +63,10 @@ TO_UTM17 = Transformer.from_crs("EPSG:4326", "EPSG:26917", always_xy=True)
 # Default pricing settings
 # ----------------------------
 DEFAULT_PRICING_SETTINGS = {
+    "Company": {
+        "company_name": "Lawn Care Company",
+        "admin_email": "",
+    },
     "Grass cutting": {
         "base_fee": 30.0,
         "rate_per_1000_sqft": 5.0,
@@ -211,8 +218,83 @@ def get_service_pricing(pricing_settings, service_type):
     return pricing_settings.get(service_type, DEFAULT_PRICING_SETTINGS["Grass cutting"])
 
 
-def get_property_multiplier(pricing_settings, property_type):
-    return float(pricing_settings.get(property_type, {}).get("multiplier", 1.0))
+def get_company_settings(pricing_settings):
+    return pricing_settings.get("Company", DEFAULT_PRICING_SETTINGS["Company"])
+
+
+def send_lead_email(admin_email, company_name, name, phone, email, notes, result):
+    """Send a lead notification email using Streamlit secrets.
+
+    Required secrets in Streamlit Cloud:
+    EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD
+
+    Optional secret:
+    EMAIL_FROM
+    """
+    if not admin_email:
+        return False, "No admin email set."
+
+    required = ["EMAIL_HOST", "EMAIL_PORT", "EMAIL_USER", "EMAIL_PASSWORD"]
+    missing = [key for key in required if key not in st.secrets]
+    if missing:
+        return False, f"Missing Streamlit secrets: {', '.join(missing)}"
+
+    host = st.secrets["EMAIL_HOST"]
+    port = int(st.secrets["EMAIL_PORT"])
+    user = st.secrets["EMAIL_USER"]
+    password = st.secrets["EMAIL_PASSWORD"]
+    from_email = st.secrets.get("EMAIL_FROM", user)
+
+    subject = f"New LawnQuote AI Lead - {result['service_type']} - ${result['price']}"
+
+    body = f"""New LawnQuote AI Lead
+
+Company: {company_name}
+Quote ID: {result['quote_id']}
+
+Customer
+Name: {name}
+Phone: {phone}
+Email: {email or 'Not provided'}
+Notes: {notes or 'None'}
+
+Property
+Address: {result['address']}
+Property Type: {result['property_type']}
+Service: {result['service_type']}
+Estimated Price: ${result['price']}
+
+Internal Estimate Details
+Estimated Lawn Sq Ft: {result['lawn_sqft']}
+Parcel Sq Ft: {result['parcel_sqft']}
+Building Sq Ft: {result['building_sqft']}
+Hardscape Sq Ft: {result['hardscape_sqft']}
+Hardscape Method: {result['hardscape_method']}
+"""
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_email
+    msg["To"] = admin_email
+    if email:
+        msg["Reply-To"] = email
+    msg.set_content(body)
+
+    context = ssl.create_default_context()
+
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, context=context) as server:
+                server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port) as server:
+                server.starttls(context=context)
+                server.login(user, password)
+                server.send_message(msg)
+        return True, "Email sent."
+    except Exception as e:
+        return False, str(e)
 
 
 # ----------------------------
@@ -730,10 +812,25 @@ with st.sidebar:
     show_admin = st.checkbox("Show admin/export")
 
     if show_admin:
+        edited_pricing = json.loads(json.dumps(pricing_settings))
+        edited_pricing.setdefault("Company", json.loads(json.dumps(DEFAULT_PRICING_SETTINGS["Company"])))
+
+        st.subheader("Company settings")
+        edited_pricing["Company"]["company_name"] = st.text_input(
+            "Company name",
+            value=str(edited_pricing["Company"].get("company_name", "Lawn Care Company")),
+            key="company_name_setting",
+        )
+        edited_pricing["Company"]["admin_email"] = st.text_input(
+            "Lead notification email",
+            value=str(edited_pricing["Company"].get("admin_email", "")),
+            placeholder="owner@company.com",
+            key="admin_email_setting",
+        )
+        st.caption("When a customer requests service, the lead will be emailed here if email secrets are configured.")
+
         st.subheader("Pricing settings")
         st.caption("Changes save to pricing_settings.json and apply to future quotes.")
-
-        edited_pricing = json.loads(json.dumps(pricing_settings))
 
         for service_name in [
             "Grass cutting",
@@ -882,8 +979,28 @@ if st.session_state.result:
                 st.error("Please enter your name and phone number.")
             else:
                 save_lead(customer_name, customer_phone, customer_email, customer_notes, r)
+
+                company_settings = get_company_settings(pricing_settings)
+                admin_email = company_settings.get("admin_email", "")
+                company_name = company_settings.get("company_name", "Lawn Care Company")
+
+                email_sent, email_message = send_lead_email(
+                    admin_email=admin_email,
+                    company_name=company_name,
+                    name=customer_name,
+                    phone=customer_phone,
+                    email=customer_email,
+                    notes=customer_notes,
+                    result=r,
+                )
+
                 st.session_state.lead_submitted = True
-                st.success("Request submitted. The company will follow up with you.")
+                if email_sent:
+                    st.success("Request submitted. The company has been notified.")
+                else:
+                    st.success("Request submitted. The company will follow up with you.")
+                    if show_admin:
+                        st.warning(f"Lead email was not sent: {email_message}")
 
 
 # ----------------------------
