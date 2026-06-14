@@ -1,0 +1,6 @@
+leads.csv
+quotes.csv
+pricing_settings.json
+__pycache__/
+*.pyc
+.env
