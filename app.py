@@ -218,6 +218,10 @@ def get_service_pricing(pricing_settings, service_type):
     return pricing_settings.get(service_type, DEFAULT_PRICING_SETTINGS["Grass cutting"])
 
 
+def get_property_multiplier(pricing_settings, property_type):
+    return float(pricing_settings.get(property_type, {}).get("multiplier", 1.0))
+
+
 def get_company_settings(pricing_settings):
     return pricing_settings.get("Company", DEFAULT_PRICING_SETTINGS["Company"])
 
