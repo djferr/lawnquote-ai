@@ -940,27 +940,38 @@ def base_tier_from_property(parcel_sqft, building_sqft, lawn_sqft, property_type
 
 
 def tier_from_ai_class(property_class, risk_level, current_tier):
-    """Use AI classification to bump the quote into a safer tier when needed."""
+    order = ["Small", "Standard", "Large", "Complex", "Estate"]
+
+    try:
+        idx = order.index(current_tier)
+    except ValueError:
+        idx = 1
+
     property_class = str(property_class or "").lower()
-    risk_level = str(risk_level or "").lower()
 
-    suggested = current_tier
+    # Pool/concrete properties usually have LESS grass
+    if property_class == "pool_or_concrete_backyard":
+        idx -= 1
 
-    if property_class == "standard_residential":
-        suggested = current_tier
-    elif property_class in ["pool_or_concrete_backyard", "high_hardscape"]:
-        suggested = max_tier(current_tier, "Complex")
-    elif property_class in ["tree_covered_or_unclear", "commercial_or_nonstandard"]:
-        suggested = max_tier(current_tier, "Complex")
+    # High hardscape usually means LESS mowing
+    elif property_class == "high_hardscape":
+        idx -= 1
+
+    # Estate lots are genuinely larger
     elif property_class == "estate_or_large_lot":
-        suggested = max_tier(current_tier, "Estate")
+        idx = max(idx, order.index("Estate"))
 
-    if risk_level == "high":
-        suggested = max_tier(suggested, "Complex")
-    elif risk_level == "medium":
-        suggested = max_tier(suggested, "Standard")
+    # Commercial is usually more complex
+    elif property_class == "commercial_or_nonstandard":
+        idx = max(idx, order.index("Complex"))
 
-    return suggested
+    # Tree cover / uncertainty shouldn't increase price
+    elif property_class == "tree_covered_or_unclear":
+        pass
+
+    idx = max(0, min(idx, len(order) - 1))
+
+    return order[idx]
 
 
 def tier_price_for_service(pricing_settings, service_type, property_type, tier_name):
