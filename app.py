@@ -62,8 +62,8 @@ DEFAULT_PRICING_SETTINGS = {
     "lead_notification_email": "",
     "enable_ai_review": True,
 
-    # Tier pricing matches how many lawn companies actually quote:
-    # $45, $55, $65, $75, etc. instead of exact per-sqft prices.
+    # Tier pricing matches how many lawn companies actually quote.
+    # Customers see a clean price like $45, $55, $65, $75, etc.
     "tier_prices": {
         "Grass cutting": {
             "Small": 45.0,
@@ -300,7 +300,7 @@ Building Sq Ft: {result.get('building_sqft')}
 Hardscape Sq Ft: {result.get('hardscape_sqft')}
 Hardscape Method: {result.get('hardscape_method')}
 Review Reasons: {result.get('review_reasons', '')}
-Pricing Tier: {result.get('pricing_tier', '')}
+Base Pricing Tier: {result.get('base_pricing_tier', '')}\nFinal Pricing Tier: {result.get('pricing_tier', '')}
 Pricing Lawn Sq Ft: {result.get('pricing_lawn_sqft', '')}
 AI Property Class: {result.get('ai_property_class', '')}
 AI Risk Level: {result.get('ai_risk_level', '')}
@@ -879,15 +879,14 @@ def quote_price_for_service(lawn_sqft, property_type, service_type, pricing_sett
 
 
 
-
 def get_tier_prices(pricing_settings, service_type):
     """Get editable tier prices for a service, with safe defaults."""
     default_tiers = DEFAULT_PRICING_SETTINGS["tier_prices"].get(
         service_type,
         DEFAULT_PRICING_SETTINGS["tier_prices"]["Grass cutting"],
     )
-
     saved = pricing_settings.get("tier_prices", {}).get(service_type, {})
+
     tiers = dict(default_tiers)
     if isinstance(saved, dict):
         tiers.update(saved)
@@ -899,10 +898,23 @@ def round_to_nearest_5(value):
     return int(round(float(value) / 5.0) * 5)
 
 
+def tier_rank(tier_name):
+    order = ["Small", "Standard", "Large", "Complex", "Estate"]
+    try:
+        return order.index(tier_name)
+    except ValueError:
+        return 1
+
+
+def max_tier(tier_a, tier_b):
+    order = ["Small", "Standard", "Large", "Complex", "Estate"]
+    return order[max(tier_rank(tier_a), tier_rank(tier_b))]
+
+
 def base_tier_from_property(parcel_sqft, building_sqft, lawn_sqft, property_type):
     """Initial deterministic tier before AI classification.
 
-    This uses parcel/building/lawn as signals, but does not pretend the sqft is perfect.
+    Sqft is only an internal signal. The customer only sees the final tier price.
     """
     parcel_sqft = float(parcel_sqft or 0)
     building_sqft = float(building_sqft or 0)
@@ -927,25 +939,8 @@ def base_tier_from_property(parcel_sqft, building_sqft, lawn_sqft, property_type
         return "Estate"
 
 
-def tier_rank(tier):
-    order = ["Small", "Standard", "Large", "Complex", "Estate"]
-    try:
-        return order.index(tier)
-    except ValueError:
-        return 1
-
-
-def max_tier(tier_a, tier_b):
-    order = ["Small", "Standard", "Large", "Complex", "Estate"]
-    return order[max(tier_rank(tier_a), tier_rank(tier_b))]
-
-
 def tier_from_ai_class(property_class, risk_level, current_tier):
-    """Use AI classification to move the quote into a safer commercial tier.
-
-    AI does not measure sqft. It only bumps the tier when the property appears harder
-    than the math estimate suggests.
-    """
+    """Use AI classification to bump the quote into a safer tier when needed."""
     property_class = str(property_class or "").lower()
     risk_level = str(risk_level or "").lower()
 
@@ -962,7 +957,7 @@ def tier_from_ai_class(property_class, risk_level, current_tier):
 
     if risk_level == "high":
         suggested = max_tier(suggested, "Complex")
-    if risk_level == "medium":
+    elif risk_level == "medium":
         suggested = max_tier(suggested, "Standard")
 
     return suggested
@@ -971,12 +966,10 @@ def tier_from_ai_class(property_class, risk_level, current_tier):
 def tier_price_for_service(pricing_settings, service_type, property_type, tier_name):
     tiers = get_tier_prices(pricing_settings, service_type)
     price = float(tiers.get(tier_name, tiers.get("Standard", 55.0)))
-
     multiplier = get_property_multiplier(pricing_settings, property_type)
     return round_to_nearest_5(price * multiplier)
 
 
-def address_autocomplete
 def address_autocomplete(searchterm: str):
     if not searchterm or len(searchterm.strip()) < 3:
         return []
@@ -1021,8 +1014,8 @@ def save_quote(result):
             "ai_property_class": result.get("ai_property_class", ""),
             "ai_risk_level": result.get("ai_risk_level", ""),
             "ai_adjustment_factor": result.get("ai_adjustment_factor", ""),
-            "pricing_lawn_sqft": result.get("pricing_lawn_sqft", ""),
             "base_pricing_tier": result.get("base_pricing_tier", ""),
+            "pricing_lawn_sqft": result.get("pricing_lawn_sqft", ""),
             "pricing_tier": result.get("pricing_tier", ""),
             "tier_pricing_sqft": result.get("tier_pricing_sqft", ""),
         },
@@ -1049,8 +1042,8 @@ def save_quote(result):
             "ai_property_class",
             "ai_risk_level",
             "ai_adjustment_factor",
-            "pricing_lawn_sqft",
             "base_pricing_tier",
+            "pricing_lawn_sqft",
             "pricing_tier",
             "tier_pricing_sqft",
         ],
@@ -1192,7 +1185,7 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
 
     # New commercial quoting model:
     # Address -> Parcel/Building/Imagery -> Service difficulty -> Pricing tier.
-    # Sqft is only an internal signal; the customer receives the tier-based quote.
+    # Sqft is only an internal signal; the customer receives only the tier-based quote.
     base_tier = base_tier_from_property(
         parcel_sqft=result["parcel_sqft"],
         building_sqft=result["building_sqft"],
@@ -1214,13 +1207,13 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
     )
 
     result["base_pricing_tier"] = base_tier
-    result["pricing_tier"] = final_tier
     result["pricing_lawn_sqft"] = ""
+    result["pricing_tier"] = final_tier
     result["tier_pricing_sqft"] = ""
     result["price"] = final_price
     result["quote_status"] = "Tier quote"
 
-    # Internal-only notes for the owner/export.
+    # If the property is risky, keep that internal only.
     if result["ai_risk_level"] in ["medium", "high"] or result["review_reasons"]:
         result["quote_status"] = "Tier quote - confirmation recommended"
 
@@ -1250,11 +1243,12 @@ with st.sidebar:
             key="lead_notification_email_setting",
         )
         edited_pricing["enable_ai_review"] = True
-        st.info("AI classification runs internally on every quote. It does not show sqft to customers. If the API key is missing or the API fails, the app falls back to the regular estimate.")
-        st.subheader("Pricing tiers")
-        st.caption("Set the prices customers actually see. Most companies quote in tiers like $45, $55, $65, $75.")
+        st.info("AI classification runs internally on every quote. Customer pricing is based on tiers, not exact sqft. If the API key is missing or fails, the app uses the base tier from GIS/math signals.")
 
-        if "tier_prices" not in edited_pricing:
+        st.subheader("Pricing tiers")
+        st.caption("Set the prices customers actually see. Most lawn companies quote in clean tiers like $45, $55, $65, $75.")
+
+        if "tier_prices" not in edited_pricing or not isinstance(edited_pricing.get("tier_prices"), dict):
             edited_pricing["tier_prices"] = json.loads(json.dumps(DEFAULT_PRICING_SETTINGS["tier_prices"]))
 
         for service_name in [
@@ -1277,7 +1271,6 @@ with st.sidebar:
                         key=f"{service_name}_{tier_name}_tier_price",
                     )
 
-        with st.expander("Property multipliers"
         with st.expander("Property multipliers", expanded=False):
             edited_pricing["Residential"]["multiplier"] = st.number_input(
                 "Residential multiplier",
