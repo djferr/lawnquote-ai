@@ -21,11 +21,6 @@ from shapely.geometry import shape
 from shapely.ops import transform
 
 try:
-    import geopandas as gpd
-except Exception:
-    gpd = None
-
-try:
     from streamlit_searchbox import st_searchbox
 except Exception:
     st_searchbox = None
@@ -42,7 +37,7 @@ st.set_page_config(
 # ----------------------------
 # File paths
 # ----------------------------
-BUILDINGS_GPKG = Path("Buildings_Open_Data.gpkg")
+BUILDINGS_GEOJSON = Path("buildings_simple.geojson")
 LEADS_CSV = Path("leads.csv")
 QUOTES_CSV = Path("quotes.csv")
 PRICING_SETTINGS_JSON = Path("pricing_settings.json")
@@ -390,7 +385,7 @@ Hardscape method: {result.get('hardscape_method')}
 """
 
         payload = {
-            "model": "gpt-5-mini",
+            "model": "gpt-4o-mini",
             "input": [
                 {
                     "role": "user",
@@ -558,42 +553,56 @@ def area_sqft_wgs84(geometry):
 
 @st.cache_resource
 def load_buildings():
-    if gpd is None:
-        return None
+    """Load simplified building footprints from buildings_simple.geojson.
 
-    if not BUILDINGS_GPKG.exists():
-        return None
+    This avoids GeoPandas/Fiona/GDAL so the app can run on Streamlit Cloud.
+    The GeoJSON was exported in EPSG:26917, so coordinates are already UTM metres.
+    Returns a list of (bounds, geometry) tuples for fast bounding-box filtering.
+    """
+    if not BUILDINGS_GEOJSON.exists():
+        return []
 
-    buildings = gpd.read_file(BUILDINGS_GPKG)
+    try:
+        with BUILDINGS_GEOJSON.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
 
-    if buildings.crs is None:
-        buildings = buildings.set_crs("EPSG:26917")
-    else:
-        buildings = buildings.to_crs("EPSG:26917")
+    buildings = []
+    for feature in data.get("features", []):
+        geom_data = feature.get("geometry")
+        if not geom_data:
+            continue
+        try:
+            geom = shape(geom_data).buffer(0)
+            if not geom.is_empty:
+                buildings.append((geom.bounds, geom))
+        except Exception:
+            continue
 
-    if "LandUse" in buildings.columns:
-        buildings = buildings[buildings["LandUse"].isin(["Residential", "Accessory"])].copy()
-
-    buildings["geometry"] = buildings.geometry.buffer(0)
     return buildings
 
 
 def building_area_inside_parcel(parcel_geometry):
     buildings = load_buildings()
 
-    if buildings is None or buildings.empty:
+    if not buildings:
         return 0, False
 
     parcel_utm = transform(lambda x, y: TO_UTM17.transform(x, y), shape(parcel_geometry))
     minx, miny, maxx, maxy = parcel_utm.bounds
-    candidates = buildings.cx[minx:maxx, miny:maxy].copy()
-
-    if candidates.empty:
-        return 0, True
 
     total_area_m2 = 0.0
+    found_candidate = False
 
-    for geom in candidates.geometry:
+    for bounds, geom in buildings:
+        bx1, by1, bx2, by2 = bounds
+
+        # Fast bounding-box reject before doing expensive intersection.
+        if bx2 < minx or bx1 > maxx or by2 < miny or by1 > maxy:
+            continue
+
+        found_candidate = True
         try:
             inter = geom.intersection(parcel_utm)
             if not inter.is_empty:
