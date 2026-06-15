@@ -329,10 +329,14 @@ def image_to_data_url(image):
 
 
 def ai_review_property(parcel_geometry, result, pricing_settings):
-    """OpenAI vision review for every quote.
+    """OpenAI vision measurement layer for every quote.
 
-    Returns a dict with confidence, notes, adjusted_lawn_sqft, and adjusted_price.
-    If OpenAI is unavailable, falls back to the original math estimate.
+    This version does not just review the math estimate. It asks the model to
+    estimate building, hardscape, and maintained lawn areas directly from the
+    aerial image, while using the GIS parcel/building/math numbers as context.
+
+    If OpenAI is unavailable or returns unusable data, the app falls back to the
+    original math estimate.
     """
     api_key = get_secret("OPENAI_API_KEY")
     if not api_key:
@@ -340,6 +344,8 @@ def ai_review_property(parcel_geometry, result, pricing_settings):
             "status": "Math estimate",
             "confidence": "none",
             "notes": "OpenAI API key is not configured, so the original math estimate was used.",
+            "ai_building_sqft": None,
+            "ai_hardscape_sqft": None,
             "adjusted_lawn_sqft": int(result.get("lawn_sqft", 0) or 0),
             "adjusted_price": int(result.get("price", 0) or 0),
         }
@@ -348,38 +354,56 @@ def ai_review_property(parcel_geometry, result, pricing_settings):
         lat, lon = parcel_centroid(parcel_geometry)
         image, top_left, zoom = fetch_mosaic(lat, lon)
         if image is None:
-            raise RuntimeError("Could not load aerial imagery for AI review.")
+            raise RuntimeError("Could not load aerial imagery for AI measurement.")
 
         data_url = image_to_data_url(image)
+
         prompt = f"""
-You are reviewing an aerial image for a lawn care instant quote system.
+You are measuring a residential property for a lawn-care instant quote system.
 
-The existing math engine has already estimated the maintained lawn area.
-Your job is to review the aerial image and adjust the maintained lawn square footage if the math estimate looks too high or too low.
+You are given:
+1. An aerial/satellite image centered on the property.
+2. GIS/math estimates from the app.
 
-Important rules:
-- Always return an adjusted_lawn_sqft number.
-- If the math estimate looks reasonable, return the same or very similar lawn sqft.
-- Focus on visible maintained grass/lawn areas.
-- Subtract obvious hardscape: driveways, patios, pools, concrete, decks, sheds, large paved areas, gravel, and buildings.
-- Be careful with tree cover and shadows. If uncertain, make a conservative adjustment and explain the uncertainty.
-- Do not return manual_review. This is an experimental AI-adjusted quote test.
+Your job is NOT to simply agree with the math estimate.
+Your job is to provide your own visual measurement estimate for:
+- building footprint area
+- hardscape area
+- maintained lawn area
+
+Definitions:
+- building_sqft = house, garage, sheds, accessory buildings.
+- hardscape_sqft = driveway, patio, pool, concrete, pavers, gravel, decks, walkways, paved/concrete backyard, and other non-lawn maintained surfaces.
+- maintained_lawn_sqft = visible maintained grass that a lawn company would likely mow.
+- Do NOT count neighbouring properties.
+- Do NOT count roofs/buildings as lawn.
+- Do NOT count pools, patios, concrete, or driveways as lawn.
+- If the backyard is mostly concrete/pool, the maintained_lawn_sqft should be low even if the parcel is large.
+- Use the GIS parcel size as a hard upper bound. The three major categories do not need to perfectly sum to the parcel because trees/unmaintained/unknown areas may exist, but they should be physically plausible.
+- Always return numeric estimates. Do not return manual_review.
 
 Return ONLY valid JSON with this exact shape:
 {{
   "confidence": "high" or "medium" or "low",
-  "adjusted_lawn_sqft": number,
-  "notes": "brief internal explanation"
+  "estimated_building_sqft": number,
+  "estimated_hardscape_sqft": number,
+  "estimated_lawn_sqft": number,
+  "notes": "brief explanation of visible pool/patio/driveway/lawn and why you chose the numbers"
 }}
 
-Math engine data:
+Important:
+- The current math estimate may be wrong. Do not anchor too strongly to it.
+- For properties with obvious concrete/pool backyards, estimate hardscape aggressively.
+- For normal grassy backyards, keep the lawn estimate close to visible maintained grass.
+
+GIS/math context:
 Address: {result.get('address')}
 Property type: {result.get('property_type')}
 Service: {result.get('service_type')}
 Parcel sqft: {result.get('parcel_sqft')}
-Building sqft: {result.get('building_sqft')}
-Hardscape sqft: {result.get('hardscape_sqft')}
-Current lawn sqft: {result.get('lawn_sqft')}
+GIS building sqft: {result.get('building_sqft')}
+Math hardscape sqft: {result.get('hardscape_sqft')}
+Math lawn sqft: {result.get('lawn_sqft')}
 Current price: ${result.get('price')}
 Hardscape method: {result.get('hardscape_method')}
 """
@@ -391,7 +415,7 @@ Hardscape method: {result.get('hardscape_method')}
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": prompt},
-                        {"type": "input_image", "image_url": data_url, "detail": "low"},
+                        {"type": "input_image", "image_url": data_url, "detail": "high"},
                     ],
                 }
             ],
@@ -401,7 +425,7 @@ Hardscape method: {result.get('hardscape_method')}
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45)
+        response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
 
@@ -412,38 +436,63 @@ Hardscape method: {result.get('hardscape_method')}
                     text_parts.append(content.get("text", ""))
         text = "\n".join(text_parts).strip()
 
+        # Some model responses may include ```json fences despite the instruction.
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+
         review = json.loads(text)
         confidence = review.get("confidence", "low")
-        adjusted_lawn_sqft = review.get("adjusted_lawn_sqft")
         notes = review.get("notes", "")
 
-        if adjusted_lawn_sqft is None:
-            adjusted_lawn_sqft = result.get("lawn_sqft", 0)
-            notes = (notes + " | AI did not return adjusted_lawn_sqft, so original math estimate was used.").strip(" |")
+        parcel_sqft = float(result.get("parcel_sqft", 0) or 0)
+        math_lawn_sqft = int(result.get("lawn_sqft", 0) or 0)
 
-        adjusted_lawn_sqft = int(max(float(adjusted_lawn_sqft), 350))
+        ai_building_sqft = review.get("estimated_building_sqft")
+        ai_hardscape_sqft = review.get("estimated_hardscape_sqft")
+        ai_lawn_sqft = review.get("estimated_lawn_sqft")
+
+        # Validate and clamp values so a weird AI response cannot break pricing.
+        if ai_lawn_sqft is None:
+            raise ValueError("AI did not return estimated_lawn_sqft.")
+
+        ai_building_sqft = int(max(float(ai_building_sqft or 0), 0))
+        ai_hardscape_sqft = int(max(float(ai_hardscape_sqft or 0), 0))
+        ai_lawn_sqft = int(max(float(ai_lawn_sqft), 350))
+
+        if parcel_sqft > 0:
+            ai_building_sqft = int(min(ai_building_sqft, parcel_sqft))
+            ai_hardscape_sqft = int(min(ai_hardscape_sqft, parcel_sqft))
+            ai_lawn_sqft = int(min(ai_lawn_sqft, parcel_sqft))
+
         adjusted_price = quote_price_for_service(
-            adjusted_lawn_sqft,
+            ai_lawn_sqft,
             result["property_type"],
             result["service_type"],
             pricing_settings,
         )
 
         return {
-            "status": "AI reviewed",
+            "status": "AI measured",
             "confidence": confidence,
             "notes": notes,
-            "adjusted_lawn_sqft": adjusted_lawn_sqft,
+            "ai_building_sqft": ai_building_sqft,
+            "ai_hardscape_sqft": ai_hardscape_sqft,
+            "adjusted_lawn_sqft": ai_lawn_sqft,
             "adjusted_price": adjusted_price,
         }
     except Exception as e:
         return {
             "status": "Math estimate",
             "confidence": "error",
-            "notes": f"AI review failed, so original math estimate was used: {e}",
+            "notes": f"AI measurement failed, so original math estimate was used: {e}",
+            "ai_building_sqft": None,
+            "ai_hardscape_sqft": None,
             "adjusted_lawn_sqft": int(result.get("lawn_sqft", 0) or 0),
             "adjusted_price": int(result.get("price", 0) or 0),
         }
+
 
 # ----------------------------
 # GIS + estimate helpers
@@ -847,6 +896,8 @@ def save_quote(result):
             "original_lawn_sqft": result.get("original_lawn_sqft", ""),
             "original_price": result.get("original_price", ""),
             "ai_review_notes": result.get("ai_review_notes", ""),
+            "ai_building_sqft": result.get("ai_building_sqft", ""),
+            "ai_hardscape_sqft": result.get("ai_hardscape_sqft", ""),
         },
         [
             "timestamp",
@@ -868,6 +919,8 @@ def save_quote(result):
             "original_lawn_sqft",
             "original_price",
             "ai_review_notes",
+            "ai_building_sqft",
+            "ai_hardscape_sqft",
         ],
     )
 
@@ -987,6 +1040,8 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
     result["original_price"] = price
     result["ai_review_confidence"] = ""
     result["ai_review_notes"] = ""
+    result["ai_building_sqft"] = ""
+    result["ai_hardscape_sqft"] = ""
 
     # Experimental mode: run AI review on every quote.
     # If OPENAI_API_KEY is missing or the API fails, ai_review_property falls back to the math estimate.
@@ -994,6 +1049,15 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
     result["quote_status"] = ai_review.get("status", "AI reviewed")
     result["ai_review_confidence"] = ai_review.get("confidence", "")
     result["ai_review_notes"] = ai_review.get("notes", "")
+    result["ai_building_sqft"] = ai_review.get("ai_building_sqft", "")
+    result["ai_hardscape_sqft"] = ai_review.get("ai_hardscape_sqft", "")
+
+    # In this test version, AI measurement can directly override the measured hardscape
+    # used for the final quote/export. The original values are still preserved in
+    # original_lawn_sqft and original_price for comparison.
+    if ai_review.get("ai_hardscape_sqft") is not None:
+        result["hardscape_sqft"] = int(ai_review.get("ai_hardscape_sqft"))
+        result["hardscape_method"] = "AI visual measurement"
 
     if ai_review.get("adjusted_lawn_sqft") is not None:
         result["lawn_sqft"] = int(ai_review.get("adjusted_lawn_sqft"))
@@ -1153,7 +1217,7 @@ if submitted:
 if st.session_state.result:
     r = st.session_state.result
 
-    status_label = "AI-adjusted estimate" if r.get("quote_status") == "AI reviewed" else "estimated price"
+    status_label = "AI-measured estimate" if r.get("quote_status") == "AI measured" else "estimated price"
     st.markdown(
         f"""
         <div class="quote-card">
