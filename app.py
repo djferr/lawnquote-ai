@@ -372,10 +372,36 @@ You are given:
 Your main job is to estimate how much of the parcel is NOT maintained lawn.
 
 Definitions:
-- non_lawn_sqft = everything inside the property parcel that a lawn company would NOT mow:
-  house, garage, sheds, pool, pool deck, patios, concrete, pavers, gravel, driveway,
-  walkways, decks, paved/concrete backyard, roof areas, gardens, trees/shrub beds,
-  and any other non-grass or non-maintained areas.
+Critical lawn-care instructions:
+
+For quoting purposes, ONLY count obvious open maintained grass as lawn.
+
+Everything else should be classified as non-lawn, including:
+- houses
+- garages
+- sheds
+- pools
+- pool decks
+- concrete
+- pavers
+- patios
+- driveways
+- gravel
+- walkways
+- decks
+- gardens
+- mulch beds
+- shrub beds
+- tree-covered areas
+- landscaped areas
+- narrow strips of grass that are unlikely to be mowed
+- areas that appear decorative rather than maintained turf
+
+When uncertain, classify the area as NON-LAWN.
+
+Your goal is to estimate the amount of grass that a lawn company would actually mow, not the amount of green visible in the image.
+
+For properties with pools, large patios, or concrete backyards, lawn area should be aggressively reduced.
 - maintained_lawn_sqft = visible maintained grass that a lawn company would likely mow.
 - If unsure whether an area is lawn or non-lawn, lean toward non-lawn.
 - Do NOT count neighbouring properties.
@@ -399,7 +425,14 @@ Important:
 - The final equation will be:
   final_lawn_sqft = parcel_sqft - estimated_non_lawn_sqft
 - Therefore estimated_non_lawn_sqft is the most important number.
-- For pool/concrete backyards, estimate non_lawn aggressively.
+- For pool/concrete backyards, assume most of the backyard is non-lawn unless obvious grass is visible.
+- Favor underestimating lawn rather than overestimating lawn.
+
+Before returning your estimate, ask yourself:
+
+"Would a lawn crew actually mow this area?"
+
+If the answer is no, classify it as non-lawn.
 
 GIS/math context:
 Address: {result.get('address')}
