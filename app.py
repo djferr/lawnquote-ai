@@ -1,12 +1,12 @@
 import csv
 import json
+import base64
+import smtplib
+from email.message import EmailMessage
 import math
 import re
-import smtplib
-import ssl
 import uuid
 from datetime import datetime
-from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
 
@@ -63,10 +63,9 @@ TO_UTM17 = Transformer.from_crs("EPSG:4326", "EPSG:26917", always_xy=True)
 # Default pricing settings
 # ----------------------------
 DEFAULT_PRICING_SETTINGS = {
-    "Company": {
-        "company_name": "Lawn Care Company",
-        "admin_email": "",
-    },
+    "company_name": "Lawn Company",
+    "lead_notification_email": "",
+    "enable_ai_review": True,
     "Grass cutting": {
         "base_fee": 30.0,
         "rate_per_1000_sqft": 5.0,
@@ -222,84 +221,234 @@ def get_property_multiplier(pricing_settings, property_type):
     return float(pricing_settings.get(property_type, {}).get("multiplier", 1.0))
 
 
-def get_company_settings(pricing_settings):
-    return pricing_settings.get("Company", DEFAULT_PRICING_SETTINGS["Company"])
+
+# ----------------------------
+# Email + AI review helpers
+# ----------------------------
+def get_secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
 
 
-def send_lead_email(admin_email, company_name, name, phone, email, notes, result):
-    """Send a lead notification email using Streamlit secrets.
+def send_lead_email(pricing_settings, customer_name, customer_phone, customer_email, customer_notes, result):
+    """Send a lead notification email using SMTP settings from Streamlit Secrets."""
+    recipient = pricing_settings.get("lead_notification_email", "").strip()
+    if not recipient:
+        return False, "No lead notification email set."
 
-    Required secrets in Streamlit Cloud:
-    EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASSWORD
+    email_host = get_secret("EMAIL_HOST")
+    email_port = int(get_secret("EMAIL_PORT", 587))
+    email_user = get_secret("EMAIL_USER") or get_secret("EMAIL_USERNAME")
+    email_password = get_secret("EMAIL_PASSWORD")
+    email_from = get_secret("EMAIL_FROM", email_user)
 
-    Optional secret:
-    EMAIL_FROM
-    """
-    if not admin_email:
-        return False, "No admin email set."
+    if not all([email_host, email_user, email_password, email_from]):
+        return False, "Email secrets are missing."
 
-    required = ["EMAIL_HOST", "EMAIL_PORT", "EMAIL_USER", "EMAIL_PASSWORD"]
-    missing = [key for key in required if key not in st.secrets]
-    if missing:
-        return False, f"Missing Streamlit secrets: {', '.join(missing)}"
+    company_name = pricing_settings.get("company_name", "Lawn Company")
+    quote_status = result.get("quote_status", "Auto quote")
+    price_text = f"${result['price']}" if quote_status != "Manual review" else "Manual review required"
 
-    host = st.secrets["EMAIL_HOST"]
-    port = int(st.secrets["EMAIL_PORT"])
-    user = st.secrets["EMAIL_USER"]
-    password = st.secrets["EMAIL_PASSWORD"]
-    from_email = st.secrets.get("EMAIL_FROM", user)
-
-    subject = f"New LawnQuote AI Lead - {result['service_type']} - ${result['price']}"
-
+    subject = f"New LawnQuote AI Lead - {result['service_type']}"
     body = f"""New LawnQuote AI Lead
 
 Company: {company_name}
 Quote ID: {result['quote_id']}
 
 Customer
-Name: {name}
-Phone: {phone}
-Email: {email or 'Not provided'}
-Notes: {notes or 'None'}
+Name: {customer_name}
+Phone: {customer_phone}
+Email: {customer_email}
+Notes: {customer_notes}
 
 Property
 Address: {result['address']}
 Property Type: {result['property_type']}
 Service: {result['service_type']}
-Estimated Price: ${result['price']}
+Quote Status: {quote_status}
+Estimated Price: {price_text}
 
-Internal Estimate Details
-Estimated Lawn Sq Ft: {result['lawn_sqft']}
-Parcel Sq Ft: {result['parcel_sqft']}
-Building Sq Ft: {result['building_sqft']}
-Hardscape Sq Ft: {result['hardscape_sqft']}
-Hardscape Method: {result['hardscape_method']}
+Internal Estimate
+Estimated Lawn Sq Ft: {result.get('lawn_sqft')}
+Parcel Sq Ft: {result.get('parcel_sqft')}
+Building Sq Ft: {result.get('building_sqft')}
+Hardscape Sq Ft: {result.get('hardscape_sqft')}
+Hardscape Method: {result.get('hardscape_method')}
+Review Reasons: {result.get('review_reasons', '')}
+AI Review Notes: {result.get('ai_review_notes', '')}
 """
 
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = admin_email
-    if email:
-        msg["Reply-To"] = email
+    msg["From"] = email_from
+    msg["To"] = recipient
     msg.set_content(body)
 
-    context = ssl.create_default_context()
-
     try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, context=context) as server:
-                server.login(user, password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port) as server:
-                server.starttls(context=context)
-                server.login(user, password)
-                server.send_message(msg)
+        with smtplib.SMTP(email_host, email_port) as server:
+            server.starttls()
+            server.login(email_user, email_password)
+            server.send_message(msg)
         return True, "Email sent."
     except Exception as e:
         return False, str(e)
 
+
+def quote_confidence(result):
+    """Decide whether this property is safe for instant pricing or should be reviewed."""
+    parcel_sqft = float(result.get("parcel_sqft", 0) or 0)
+    lawn_sqft = float(result.get("lawn_sqft", 0) or 0)
+    hardscape_sqft = float(result.get("hardscape_sqft", 0) or 0)
+    building_sqft = float(result.get("building_sqft", 0) or 0)
+    property_type = result.get("property_type", "Residential")
+
+    usable_yard = max(parcel_sqft - building_sqft, 1)
+    hardscape_ratio = hardscape_sqft / usable_yard
+
+    reasons = []
+
+    if property_type == "Commercial":
+        reasons.append("Commercial property")
+    if parcel_sqft > 20000:
+        reasons.append("Large or estate-size parcel")
+    if lawn_sqft > 12000:
+        reasons.append("Large estimated maintained lawn area")
+    if hardscape_ratio > 0.35:
+        reasons.append("High hardscape ratio")
+    if building_sqft <= 0:
+        reasons.append("Building footprint unavailable")
+
+    if reasons:
+        return "Manual review", reasons
+
+    return "Auto quote", []
+
+
+def image_to_data_url(image):
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def ai_review_property(parcel_geometry, result, pricing_settings):
+    """OpenAI vision review for every quote.
+
+    Returns a dict with confidence, notes, adjusted_lawn_sqft, and adjusted_price.
+    If OpenAI is unavailable, falls back to the original math estimate.
+    """
+    api_key = get_secret("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "Math estimate",
+            "confidence": "none",
+            "notes": "OpenAI API key is not configured, so the original math estimate was used.",
+            "adjusted_lawn_sqft": int(result.get("lawn_sqft", 0) or 0),
+            "adjusted_price": int(result.get("price", 0) or 0),
+        }
+
+    try:
+        lat, lon = parcel_centroid(parcel_geometry)
+        image, top_left, zoom = fetch_mosaic(lat, lon)
+        if image is None:
+            raise RuntimeError("Could not load aerial imagery for AI review.")
+
+        data_url = image_to_data_url(image)
+        prompt = f"""
+You are reviewing an aerial image for a lawn care instant quote system.
+
+The existing math engine has already estimated the maintained lawn area.
+Your job is to review the aerial image and adjust the maintained lawn square footage if the math estimate looks too high or too low.
+
+Important rules:
+- Always return an adjusted_lawn_sqft number.
+- If the math estimate looks reasonable, return the same or very similar lawn sqft.
+- Focus on visible maintained grass/lawn areas.
+- Subtract obvious hardscape: driveways, patios, pools, concrete, decks, sheds, large paved areas, gravel, and buildings.
+- Be careful with tree cover and shadows. If uncertain, make a conservative adjustment and explain the uncertainty.
+- Do not return manual_review. This is an experimental AI-adjusted quote test.
+
+Return ONLY valid JSON with this exact shape:
+{{
+  "confidence": "high" or "medium" or "low",
+  "adjusted_lawn_sqft": number,
+  "notes": "brief internal explanation"
+}}
+
+Math engine data:
+Address: {result.get('address')}
+Property type: {result.get('property_type')}
+Service: {result.get('service_type')}
+Parcel sqft: {result.get('parcel_sqft')}
+Building sqft: {result.get('building_sqft')}
+Hardscape sqft: {result.get('hardscape_sqft')}
+Current lawn sqft: {result.get('lawn_sqft')}
+Current price: ${result.get('price')}
+Hardscape method: {result.get('hardscape_method')}
+"""
+
+        payload = {
+            "model": "gpt-5-mini",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url, "detail": "low"},
+                    ],
+                }
+            ],
+        }
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        response = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=45)
+        response.raise_for_status()
+        data = response.json()
+
+        text_parts = []
+        for item in data.get("output", []):
+            for content in item.get("content", []):
+                if content.get("type") == "output_text":
+                    text_parts.append(content.get("text", ""))
+        text = "\n".join(text_parts).strip()
+
+        review = json.loads(text)
+        confidence = review.get("confidence", "low")
+        adjusted_lawn_sqft = review.get("adjusted_lawn_sqft")
+        notes = review.get("notes", "")
+
+        if adjusted_lawn_sqft is None:
+            adjusted_lawn_sqft = result.get("lawn_sqft", 0)
+            notes = (notes + " | AI did not return adjusted_lawn_sqft, so original math estimate was used.").strip(" |")
+
+        adjusted_lawn_sqft = int(max(float(adjusted_lawn_sqft), 350))
+        adjusted_price = quote_price_for_service(
+            adjusted_lawn_sqft,
+            result["property_type"],
+            result["service_type"],
+            pricing_settings,
+        )
+
+        return {
+            "status": "AI reviewed",
+            "confidence": confidence,
+            "notes": notes,
+            "adjusted_lawn_sqft": adjusted_lawn_sqft,
+            "adjusted_price": adjusted_price,
+        }
+    except Exception as e:
+        return {
+            "status": "Math estimate",
+            "confidence": "error",
+            "notes": f"AI review failed, so original math estimate was used: {e}",
+            "adjusted_lawn_sqft": int(result.get("lawn_sqft", 0) or 0),
+            "adjusted_price": int(result.get("price", 0) or 0),
+        }
 
 # ----------------------------
 # GIS + estimate helpers
@@ -683,6 +832,12 @@ def save_quote(result):
             "fixed_hardscape_sqft": result["fixed_hardscape_sqft"],
             "satellite_hardscape_sqft": result["satellite_hardscape_sqft"],
             "hardscape_method": result["hardscape_method"],
+            "quote_status": result.get("quote_status", ""),
+            "review_reasons": result.get("review_reasons", ""),
+            "ai_review_confidence": result.get("ai_review_confidence", ""),
+            "original_lawn_sqft": result.get("original_lawn_sqft", ""),
+            "original_price": result.get("original_price", ""),
+            "ai_review_notes": result.get("ai_review_notes", ""),
         },
         [
             "timestamp",
@@ -698,6 +853,12 @@ def save_quote(result):
             "fixed_hardscape_sqft",
             "satellite_hardscape_sqft",
             "hardscape_method",
+            "quote_status",
+            "review_reasons",
+            "ai_review_confidence",
+            "original_lawn_sqft",
+            "original_price",
+            "ai_review_notes",
         ],
     )
 
@@ -717,6 +878,7 @@ def save_lead(name, phone, email, notes, result):
             "service_type": result["service_type"],
             "estimated_price": result["price"],
             "estimated_lawn_sqft": result["lawn_sqft"],
+            "quote_status": result.get("quote_status", ""),
             "status": "New",
         },
         [
@@ -731,6 +893,7 @@ def save_lead(name, phone, email, notes, result):
             "service_type",
             "estimated_price",
             "estimated_lawn_sqft",
+            "quote_status",
             "status",
         ],
     )
@@ -792,7 +955,7 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
         pricing_settings,
     )
 
-    return {
+    result = {
         "quote_id": str(uuid.uuid4())[:8].upper(),
         "address": selected_address,
         "property_type": property_type,
@@ -808,6 +971,28 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
         "building_data_used": building_data_used,
     }
 
+    quote_status, review_reasons = quote_confidence(result)
+    result["quote_status"] = "Math estimate"
+    result["review_reasons"] = ", ".join(review_reasons)
+    result["original_lawn_sqft"] = int(lawn_sqft)
+    result["original_price"] = price
+    result["ai_review_confidence"] = ""
+    result["ai_review_notes"] = ""
+
+    # Experimental mode: run AI review on every quote.
+    # If OPENAI_API_KEY is missing or the API fails, ai_review_property falls back to the math estimate.
+    ai_review = ai_review_property(parcel_geom, result, pricing_settings)
+    result["quote_status"] = ai_review.get("status", "AI reviewed")
+    result["ai_review_confidence"] = ai_review.get("confidence", "")
+    result["ai_review_notes"] = ai_review.get("notes", "")
+
+    if ai_review.get("adjusted_lawn_sqft") is not None:
+        result["lawn_sqft"] = int(ai_review.get("adjusted_lawn_sqft"))
+    if ai_review.get("adjusted_price") is not None:
+        result["price"] = int(ai_review.get("adjusted_price"))
+
+    return result
+
 
 # ----------------------------
 # Sidebar: hidden admin controls
@@ -816,25 +1001,25 @@ with st.sidebar:
     show_admin = st.checkbox("Show admin/export")
 
     if show_admin:
-        edited_pricing = json.loads(json.dumps(pricing_settings))
-        edited_pricing.setdefault("Company", json.loads(json.dumps(DEFAULT_PRICING_SETTINGS["Company"])))
-
         st.subheader("Company settings")
-        edited_pricing["Company"]["company_name"] = st.text_input(
+        st.caption("These settings save to pricing_settings.json and apply to future leads/quotes.")
+
+        edited_pricing = json.loads(json.dumps(pricing_settings))
+
+        edited_pricing["company_name"] = st.text_input(
             "Company name",
-            value=str(edited_pricing["Company"].get("company_name", "Lawn Care Company")),
+            value=str(edited_pricing.get("company_name", "Lawn Company")),
             key="company_name_setting",
         )
-        edited_pricing["Company"]["admin_email"] = st.text_input(
+        edited_pricing["lead_notification_email"] = st.text_input(
             "Lead notification email",
-            value=str(edited_pricing["Company"].get("admin_email", "")),
-            placeholder="owner@company.com",
-            key="admin_email_setting",
+            value=str(edited_pricing.get("lead_notification_email", "")),
+            key="lead_notification_email_setting",
         )
-        st.caption("When a customer requests service, the lead will be emailed here if email secrets are configured.")
+        edited_pricing["enable_ai_review"] = True
+        st.info("AI review runs on every quote in this test version. It requires OPENAI_API_KEY in Streamlit Secrets. If the key is missing or the API fails, the app falls back to the math estimate.")
 
         st.subheader("Pricing settings")
-        st.caption("Changes save to pricing_settings.json and apply to future quotes.")
 
         for service_name in [
             "Grass cutting",
@@ -959,17 +1144,17 @@ if submitted:
 if st.session_state.result:
     r = st.session_state.result
 
+    status_label = "AI-adjusted estimate" if r.get("quote_status") == "AI reviewed" else "estimated price"
     st.markdown(
         f"""
         <div class="quote-card">
             <div class="quote-service">{r['service_type']}</div>
             <div class="quote-price">${r['price']}</div>
-            <div class="quote-label">estimated price</div>
+            <div class="quote-label">{status_label}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-
     st.markdown('<div class="fine-print">Final price may be confirmed after first visit if site conditions differ.</div>', unsafe_allow_html=True)
 
     with st.expander("Request this service"):
@@ -983,28 +1168,21 @@ if st.session_state.result:
                 st.error("Please enter your name and phone number.")
             else:
                 save_lead(customer_name, customer_phone, customer_email, customer_notes, r)
-
-                company_settings = get_company_settings(pricing_settings)
-                admin_email = company_settings.get("admin_email", "")
-                company_name = company_settings.get("company_name", "Lawn Care Company")
-
                 email_sent, email_message = send_lead_email(
-                    admin_email=admin_email,
-                    company_name=company_name,
-                    name=customer_name,
-                    phone=customer_phone,
-                    email=customer_email,
-                    notes=customer_notes,
-                    result=r,
+                    pricing_settings,
+                    customer_name,
+                    customer_phone,
+                    customer_email,
+                    customer_notes,
+                    r,
                 )
-
                 st.session_state.lead_submitted = True
                 if email_sent:
-                    st.success("Request submitted. The company has been notified.")
+                    st.success("Request submitted. The company will follow up with you.")
                 else:
                     st.success("Request submitted. The company will follow up with you.")
                     if show_admin:
-                        st.warning(f"Lead email was not sent: {email_message}")
+                        st.warning(f"Lead saved, but email was not sent: {email_message}")
 
 
 # ----------------------------
