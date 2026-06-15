@@ -272,6 +272,11 @@ Building Sq Ft: {result.get('building_sqft')}
 Hardscape Sq Ft: {result.get('hardscape_sqft')}
 Hardscape Method: {result.get('hardscape_method')}
 Review Reasons: {result.get('review_reasons', '')}
+Pricing Tier: {result.get('pricing_tier', '')}
+Pricing Lawn Sq Ft: {result.get('pricing_lawn_sqft', '')}
+AI Property Class: {result.get('ai_property_class', '')}
+AI Risk Level: {result.get('ai_risk_level', '')}
+AI Adjustment Factor: {result.get('ai_adjustment_factor', '')}
 AI Review Notes: {result.get('ai_review_notes', '')}
 """
 
@@ -329,17 +334,13 @@ def image_to_data_url(image):
 
 
 def ai_review_property(parcel_geometry, result, pricing_settings):
-    """OpenAI vision non-lawn measurement layer for every quote.
+    """OpenAI vision classifier for every quote.
 
-    This version asks AI one simpler question:
-
-        How much of the parcel is NOT maintained lawn?
-
-    Then the app calculates:
-
-        final_lawn_sqft = parcel_sqft - AI_non_lawn_sqft
-
-    This avoids inconsistent outputs where parcel/building/hardscape/lawn do not reconcile.
+    Commercial-safe approach:
+    - AI does NOT provide the final sqft measurement.
+    - AI classifies the property type/risk from the aerial image.
+    - The app uses that classification to make the pricing tier more conservative.
+    - Customer only sees service + quote, not lawn sqft.
     """
     api_key = get_secret("OPENAI_API_KEY")
     if not api_key:
@@ -347,92 +348,62 @@ def ai_review_property(parcel_geometry, result, pricing_settings):
             "status": "Math estimate",
             "confidence": "none",
             "notes": "OpenAI API key is not configured, so the original math estimate was used.",
-            "ai_non_lawn_sqft": None,
-            "ai_building_sqft": None,
-            "ai_hardscape_sqft": None,
-            "adjusted_lawn_sqft": int(result.get("lawn_sqft", 0) or 0),
-            "adjusted_price": int(result.get("price", 0) or 0),
+            "property_class": "unknown",
+            "risk_level": "unknown",
+            "adjustment_factor": 1.0,
         }
 
     try:
         lat, lon = parcel_centroid(parcel_geometry)
         image, top_left, zoom = fetch_mosaic(lat, lon)
         if image is None:
-            raise RuntimeError("Could not load aerial imagery for AI measurement.")
+            raise RuntimeError("Could not load aerial imagery for AI classification.")
 
         data_url = image_to_data_url(image)
 
         prompt = f"""
-You are measuring a property for a lawn-care instant quote system.
+You are reviewing an aerial image for a lawn-care instant quote system.
 
-You are given:
-1. An aerial/satellite image centered on the property.
-2. GIS/math estimates from the app.
+Your job is NOT to measure exact square footage.
+Your job is to classify the property so the quote can be made safer.
 
-Your main job is to estimate how much of the parcel is NOT maintained lawn.
+The app already has GIS/math estimates:
+- parcel area
+- building footprint
+- satellite hardscape estimate
+- math lawn estimate
 
-Definitions:
-Critical lawn-care instructions:
+You must decide whether the property looks like a standard lawn or a risky/high-hardscape property.
 
-For quoting purposes, ONLY count obvious open maintained grass as lawn.
-
-Everything else should be classified as non-lawn, including:
-- houses
-- garages
-- sheds
-- pools
-- pool decks
-- concrete
-- pavers
-- patios
-- driveways
-- gravel
-- walkways
-- decks
-- gardens
-- mulch beds
-- shrub beds
-- tree-covered areas
-- landscaped areas
-- narrow strips of grass that are unlikely to be mowed
-- areas that appear decorative rather than maintained turf
-
-When uncertain, classify the area as NON-LAWN.
-
-Your goal is to estimate the amount of grass that a lawn company would actually mow, not the amount of green visible in the image.
-
-For properties with pools, large patios, or concrete backyards, lawn area should be aggressively reduced.
-- maintained_lawn_sqft = visible maintained grass that a lawn company would likely mow.
-- If unsure whether an area is lawn or non-lawn, lean toward non-lawn.
-- Do NOT count neighbouring properties.
-- Do NOT count buildings, pool, concrete, patios, pavers, driveway, decks, or gravel as lawn.
-- If the backyard is mostly concrete/pool, non_lawn_sqft should be high and maintained_lawn_sqft should be low.
-- Use the GIS parcel size as a hard upper bound.
-- Always return numeric estimates. Do not return manual_review.
+Property classes:
+- "standard_residential": normal house with normal grass areas.
+- "pool_or_concrete_backyard": pool, pool deck, concrete backyard, pavers, patio-dominant yard.
+- "high_hardscape": unusually large driveway/patio/paving/concrete/gravel.
+- "tree_covered_or_unclear": tree cover/shadows make mowable lawn hard to see.
+- "estate_or_large_lot": large lot where not all land may be maintained lawn.
+- "commercial_or_nonstandard": commercial or unusual property.
 
 Return ONLY valid JSON with this exact shape:
 {{
   "confidence": "high" or "medium" or "low",
-  "estimated_non_lawn_sqft": number,
-  "estimated_building_sqft": number,
-  "estimated_hardscape_sqft": number,
-  "estimated_lawn_sqft": number,
-  "notes": "brief explanation of visible pool/patio/driveway/lawn and why you chose the non-lawn number"
+  "property_class": "standard_residential" or "pool_or_concrete_backyard" or "high_hardscape" or "tree_covered_or_unclear" or "estate_or_large_lot" or "commercial_or_nonstandard",
+  "risk_level": "low" or "medium" or "high",
+  "adjustment_factor": number,
+  "notes": "brief internal explanation"
 }}
 
+Adjustment factor rules:
+- 1.00 = no adjustment; normal property.
+- 0.85 = slightly reduce effective lawn/pricing size.
+- 0.70 = meaningfully reduce effective lawn/pricing size.
+- 0.55 = strongly reduce effective lawn/pricing size for pool/concrete/high-hardscape yards.
+- 0.40 = extreme case where very little visible mowable grass exists.
+
 Important:
-- The app will NOT directly trust your lawn_sqft if it conflicts with the parcel.
-- The final equation will be:
-  final_lawn_sqft = parcel_sqft - estimated_non_lawn_sqft
-- Therefore estimated_non_lawn_sqft is the most important number.
-- For pool/concrete backyards, assume most of the backyard is non-lawn unless obvious grass is visible.
-- Favor underestimating lawn rather than overestimating lawn.
-
-Before returning your estimate, ask yourself:
-
-"Would a lawn crew actually mow this area?"
-
-If the answer is no, classify it as non-lawn.
+- When the backyard contains a pool and mostly concrete/pavers, use "pool_or_concrete_backyard" and an adjustment_factor between 0.40 and 0.70.
+- When unsure, be conservative for the lawn company and reduce the effective lawn size.
+- Do not count pool decks, concrete, pavers, patios, driveways, gravel, beds, shrubs, decorative areas, or tree-covered uncertain areas as reliable mowable lawn.
+- Ask yourself: "Would a lawn crew actually mow this area?" If no, treat it as a risk that should reduce the pricing size.
 
 GIS/math context:
 Address: {result.get('address')}
@@ -474,82 +445,47 @@ Hardscape method: {result.get('hardscape_method')}
                     text_parts.append(content.get("text", ""))
         text = "\n".join(text_parts).strip()
 
-        # Some model responses may include ```json fences despite the instruction.
         if text.startswith("```"):
             text = text.strip("`")
             if text.lower().startswith("json"):
                 text = text[4:].strip()
 
         review = json.loads(text)
-        confidence = review.get("confidence", "low")
+        confidence = str(review.get("confidence", "low")).lower()
+        property_class = str(review.get("property_class", "standard_residential"))
+        risk_level = str(review.get("risk_level", "medium")).lower()
         notes = review.get("notes", "")
 
-        parcel_sqft = int(float(result.get("parcel_sqft", 0) or 0))
-        gis_building_sqft = int(float(result.get("building_sqft", 0) or 0))
+        try:
+            adjustment_factor = float(review.get("adjustment_factor", 1.0))
+        except Exception:
+            adjustment_factor = 1.0
 
-        ai_non_lawn_raw = review.get("estimated_non_lawn_sqft")
-        ai_building_raw = review.get("estimated_building_sqft")
-        ai_hardscape_raw = review.get("estimated_hardscape_sqft")
+        # Safety clamps: AI can classify risk, but cannot destroy pricing.
+        adjustment_factor = max(0.40, min(adjustment_factor, 1.0))
 
-        if ai_non_lawn_raw is None:
-            raise ValueError("AI did not return estimated_non_lawn_sqft.")
-
-        ai_non_lawn_sqft = int(max(float(ai_non_lawn_raw), 0))
-        ai_building_sqft = int(max(float(ai_building_raw or 0), 0))
-        ai_hardscape_sqft = int(max(float(ai_hardscape_raw or 0), 0))
-
-        if parcel_sqft > 0:
-            ai_non_lawn_sqft = int(min(ai_non_lawn_sqft, parcel_sqft))
-            ai_building_sqft = int(min(ai_building_sqft, parcel_sqft))
-            ai_hardscape_sqft = int(min(ai_hardscape_sqft, parcel_sqft))
-
-        # Main corrected equation:
-        # final lawn = parcel - AI non-lawn
-        final_lawn_sqft = int(parcel_sqft - ai_non_lawn_sqft)
-
-        # Keep a small floor so pricing does not break if AI overestimates non-lawn.
-        final_lawn_sqft = max(final_lawn_sqft, 350)
-
-        # For the hardscape export, estimate non-building non-lawn.
-        # GIS building is preferred because it is usually more reliable than visual building estimation.
-        building_for_breakdown = gis_building_sqft if gis_building_sqft > 0 else ai_building_sqft
-        final_hardscape_sqft = max(ai_non_lawn_sqft - building_for_breakdown, 0)
-
-        adjusted_price = quote_price_for_service(
-            final_lawn_sqft,
-            result["property_type"],
-            result["service_type"],
-            pricing_settings,
-        )
-
-        notes = (
-            f"{notes} | Final lawn calculated by formula: "
-            f"{parcel_sqft} parcel - {ai_non_lawn_sqft} AI non-lawn = "
-            f"{final_lawn_sqft} sqft. Export hardscape uses "
-            f"{ai_non_lawn_sqft} non-lawn - {building_for_breakdown} building = "
-            f"{final_hardscape_sqft} sqft."
-        )
+        # Extra deterministic protection for known risky classes.
+        if property_class in ["pool_or_concrete_backyard", "high_hardscape"]:
+            adjustment_factor = min(adjustment_factor, 0.70)
+        if property_class in ["tree_covered_or_unclear", "estate_or_large_lot", "commercial_or_nonstandard"]:
+            adjustment_factor = min(adjustment_factor, 0.85)
 
         return {
-            "status": "AI non-lawn measured",
+            "status": "AI classified",
             "confidence": confidence,
             "notes": notes,
-            "ai_non_lawn_sqft": ai_non_lawn_sqft,
-            "ai_building_sqft": ai_building_sqft,
-            "ai_hardscape_sqft": final_hardscape_sqft,
-            "adjusted_lawn_sqft": final_lawn_sqft,
-            "adjusted_price": adjusted_price,
+            "property_class": property_class,
+            "risk_level": risk_level,
+            "adjustment_factor": adjustment_factor,
         }
     except Exception as e:
         return {
             "status": "Math estimate",
             "confidence": "error",
-            "notes": f"AI non-lawn measurement failed, so original math estimate was used: {e}",
-            "ai_non_lawn_sqft": None,
-            "ai_building_sqft": None,
-            "ai_hardscape_sqft": None,
-            "adjusted_lawn_sqft": int(result.get("lawn_sqft", 0) or 0),
-            "adjusted_price": int(result.get("price", 0) or 0),
+            "notes": f"AI classification failed, so the original math estimate was used: {e}",
+            "property_class": "unknown",
+            "risk_level": "unknown",
+            "adjustment_factor": 1.0,
         }
 
 
@@ -914,6 +850,38 @@ def quote_price_for_service(lawn_sqft, property_type, service_type, pricing_sett
     return int(max(price, minimum_price))
 
 
+
+def pricing_tier_for_lawn(lawn_sqft):
+    """Convert internal lawn estimate into a broad pricing bucket.
+
+    Customer never sees sqft. Buckets reduce sensitivity to imperfect measurements.
+    """
+    lawn_sqft = int(max(lawn_sqft, 0))
+
+    if lawn_sqft <= 2000:
+        return "Small", 1500
+    elif lawn_sqft <= 5000:
+        return "Standard", 3500
+    elif lawn_sqft <= 9000:
+        return "Large", 7000
+    elif lawn_sqft <= 14000:
+        return "Extra large", 11000
+    else:
+        return "Estate", 16000
+
+
+def commercial_safe_price(lawn_sqft, property_type, service_type, pricing_settings):
+    """Price using broad buckets instead of pretending exact sqft is perfect."""
+    tier_name, tier_pricing_sqft = pricing_tier_for_lawn(lawn_sqft)
+    price = quote_price_for_service(
+        tier_pricing_sqft,
+        property_type,
+        service_type,
+        pricing_settings,
+    )
+    return price, tier_name, tier_pricing_sqft
+
+
 def address_autocomplete(searchterm: str):
     if not searchterm or len(searchterm.strip()) < 3:
         return []
@@ -955,9 +923,12 @@ def save_quote(result):
             "original_lawn_sqft": result.get("original_lawn_sqft", ""),
             "original_price": result.get("original_price", ""),
             "ai_review_notes": result.get("ai_review_notes", ""),
-            "ai_building_sqft": result.get("ai_building_sqft", ""),
-            "ai_hardscape_sqft": result.get("ai_hardscape_sqft", ""),
-            "ai_non_lawn_sqft": result.get("ai_non_lawn_sqft", ""),
+            "ai_property_class": result.get("ai_property_class", ""),
+            "ai_risk_level": result.get("ai_risk_level", ""),
+            "ai_adjustment_factor": result.get("ai_adjustment_factor", ""),
+            "pricing_lawn_sqft": result.get("pricing_lawn_sqft", ""),
+            "pricing_tier": result.get("pricing_tier", ""),
+            "tier_pricing_sqft": result.get("tier_pricing_sqft", ""),
         },
         [
             "timestamp",
@@ -979,9 +950,12 @@ def save_quote(result):
             "original_lawn_sqft",
             "original_price",
             "ai_review_notes",
-            "ai_building_sqft",
-            "ai_hardscape_sqft",
-            "ai_non_lawn_sqft",
+            "ai_property_class",
+            "ai_risk_level",
+            "ai_adjustment_factor",
+            "pricing_lawn_sqft",
+            "pricing_tier",
+            "tier_pricing_sqft",
         ],
     )
 
@@ -1002,6 +976,7 @@ def save_lead(name, phone, email, notes, result):
             "estimated_price": result["price"],
             "estimated_lawn_sqft": result["lawn_sqft"],
             "quote_status": result.get("quote_status", ""),
+            "pricing_tier": result.get("pricing_tier", ""),
             "status": "New",
         },
         [
@@ -1017,6 +992,7 @@ def save_lead(name, phone, email, notes, result):
             "estimated_price",
             "estimated_lawn_sqft",
             "quote_status",
+            "pricing_tier",
             "status",
         ],
     )
@@ -1095,37 +1071,46 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
     }
 
     quote_status, review_reasons = quote_confidence(result)
+
     result["quote_status"] = "Math estimate"
     result["review_reasons"] = ", ".join(review_reasons)
     result["original_lawn_sqft"] = int(lawn_sqft)
     result["original_price"] = price
+
+    # AI is now used as an internal classifier, not as the measuring tape.
+    # It can reduce the effective pricing size for high-risk/high-hardscape properties.
     result["ai_review_confidence"] = ""
     result["ai_review_notes"] = ""
-    result["ai_building_sqft"] = ""
-    result["ai_hardscape_sqft"] = ""
-    result["ai_non_lawn_sqft"] = ""
+    result["ai_property_class"] = ""
+    result["ai_risk_level"] = ""
+    result["ai_adjustment_factor"] = 1.0
 
-    # Experimental mode: run AI review on every quote.
-    # If OPENAI_API_KEY is missing or the API fails, ai_review_property falls back to the math estimate.
     ai_review = ai_review_property(parcel_geom, result, pricing_settings)
-    result["quote_status"] = ai_review.get("status", "AI reviewed")
+    result["quote_status"] = ai_review.get("status", "Math estimate")
     result["ai_review_confidence"] = ai_review.get("confidence", "")
     result["ai_review_notes"] = ai_review.get("notes", "")
-    result["ai_building_sqft"] = ai_review.get("ai_building_sqft", "")
-    result["ai_hardscape_sqft"] = ai_review.get("ai_hardscape_sqft", "")
-    result["ai_non_lawn_sqft"] = ai_review.get("ai_non_lawn_sqft", "")
+    result["ai_property_class"] = ai_review.get("property_class", "")
+    result["ai_risk_level"] = ai_review.get("risk_level", "")
+    result["ai_adjustment_factor"] = float(ai_review.get("adjustment_factor", 1.0) or 1.0)
 
-    # In this test version, AI non-lawn measurement drives the measured hardscape
-    # used for the final quote/export; final lawn is parcel - building - AI hardscape. The original values are still preserved in
-    # original_lawn_sqft and original_price for comparison.
-    if ai_review.get("ai_hardscape_sqft") is not None:
-        result["hardscape_sqft"] = int(ai_review.get("ai_hardscape_sqft"))
-        result["hardscape_method"] = "AI non-lawn measurement"
+    # Keep the original measured sqft internally, but price from a conservative bucket.
+    pricing_lawn_sqft = int(max(result["lawn_sqft"] * result["ai_adjustment_factor"], 350))
+    final_price, pricing_tier, tier_pricing_sqft = commercial_safe_price(
+        pricing_lawn_sqft,
+        property_type,
+        service_type,
+        pricing_settings,
+    )
 
-    if ai_review.get("adjusted_lawn_sqft") is not None:
-        result["lawn_sqft"] = int(ai_review.get("adjusted_lawn_sqft"))
-    if ai_review.get("adjusted_price") is not None:
-        result["price"] = int(ai_review.get("adjusted_price"))
+    result["pricing_lawn_sqft"] = pricing_lawn_sqft
+    result["pricing_tier"] = pricing_tier
+    result["tier_pricing_sqft"] = tier_pricing_sqft
+    result["price"] = final_price
+
+    # If the property is risky, don't expose that to the customer as a warning.
+    # Just keep it internally and use the fine-print confirmation language.
+    if result["ai_risk_level"] in ["medium", "high"] or result["review_reasons"]:
+        result["quote_status"] = "Estimated quote - confirmation recommended"
 
     return result
 
@@ -1153,7 +1138,7 @@ with st.sidebar:
             key="lead_notification_email_setting",
         )
         edited_pricing["enable_ai_review"] = True
-        st.info("AI non-lawn measurement runs on every quote in this test version. It requires OPENAI_API_KEY in Streamlit Secrets. If the key is missing or the API fails, the app falls back to the math estimate.")
+        st.info("AI classification runs internally on every quote. It does not show sqft to customers. If the API key is missing or the API fails, the app falls back to the regular estimate.")
 
         st.subheader("Pricing settings")
 
@@ -1280,7 +1265,7 @@ if submitted:
 if st.session_state.result:
     r = st.session_state.result
 
-    status_label = "AI non-lawn estimate" if r.get("quote_status") == "AI non-lawn measured" else "estimated price"
+    status_label = "estimated price"
     st.markdown(
         f"""
         <div class="quote-card">
