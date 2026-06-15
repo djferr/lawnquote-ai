@@ -329,14 +329,18 @@ def image_to_data_url(image):
 
 
 def ai_review_property(parcel_geometry, result, pricing_settings):
-    """OpenAI vision measurement layer for every quote.
+    """OpenAI vision hardscape measurement layer for every quote.
 
-    This version does not just review the math estimate. It asks the model to
-    estimate building, hardscape, and maintained lawn areas directly from the
-    aerial image, while using the GIS parcel/building/math numbers as context.
+    IMPORTANT:
+    The AI does NOT directly control the final lawn sqft.
 
-    If OpenAI is unavailable or returns unusable data, the app falls back to the
-    original math estimate.
+    The AI estimates visual hardscape.
+    The app then calculates the final lawn area with:
+
+        final_lawn_sqft = parcel_sqft - GIS_building_sqft - AI_hardscape_sqft
+
+    This keeps the numbers physically consistent and prevents impossible outputs
+    where parcel/building/hardscape/lawn do not reconcile.
     """
     api_key = get_secret("OPENAI_API_KEY")
     if not api_key:
@@ -359,27 +363,27 @@ def ai_review_property(parcel_geometry, result, pricing_settings):
         data_url = image_to_data_url(image)
 
         prompt = f"""
-You are measuring a residential property for a lawn-care instant quote system.
+You are measuring hardscape for a lawn-care instant quote system.
 
 You are given:
 1. An aerial/satellite image centered on the property.
 2. GIS/math estimates from the app.
 
-Your job is NOT to simply agree with the math estimate.
-Your job is to provide your own visual measurement estimate for:
-- building footprint area
-- hardscape area
-- maintained lawn area
+Your main job is to estimate HARDscape area visually.
 
 Definitions:
 - building_sqft = house, garage, sheds, accessory buildings.
 - hardscape_sqft = driveway, patio, pool, concrete, pavers, gravel, decks, walkways, paved/concrete backyard, and other non-lawn maintained surfaces.
-- maintained_lawn_sqft = visible maintained grass that a lawn company would likely mow.
+- visual_lawn_sqft = visible maintained grass that a lawn company would likely mow.
+
+Critical instructions:
+- Do NOT simply agree with the math estimate.
+- Estimate the hardscape from the image as directly as possible.
+- If the backyard is mostly concrete/pool, hardscape_sqft should be high and lawn should be low.
 - Do NOT count neighbouring properties.
 - Do NOT count roofs/buildings as lawn.
 - Do NOT count pools, patios, concrete, or driveways as lawn.
-- If the backyard is mostly concrete/pool, the maintained_lawn_sqft should be low even if the parcel is large.
-- Use the GIS parcel size as a hard upper bound. The three major categories do not need to perfectly sum to the parcel because trees/unmaintained/unknown areas may exist, but they should be physically plausible.
+- Use the parcel size as a reality check.
 - Always return numeric estimates. Do not return manual_review.
 
 Return ONLY valid JSON with this exact shape:
@@ -387,14 +391,9 @@ Return ONLY valid JSON with this exact shape:
   "confidence": "high" or "medium" or "low",
   "estimated_building_sqft": number,
   "estimated_hardscape_sqft": number,
-  "estimated_lawn_sqft": number,
-  "notes": "brief explanation of visible pool/patio/driveway/lawn and why you chose the numbers"
+  "visual_lawn_sqft": number,
+  "notes": "brief explanation of visible pool/patio/driveway/lawn and why you chose the hardscape number"
 }}
-
-Important:
-- The current math estimate may be wrong. Do not anchor too strongly to it.
-- For properties with obvious concrete/pool backyards, estimate hardscape aggressively.
-- For normal grassy backyards, keep the lawn estimate close to visible maintained grass.
 
 GIS/math context:
 Address: {result.get('address')}
@@ -406,6 +405,11 @@ Math hardscape sqft: {result.get('hardscape_sqft')}
 Math lawn sqft: {result.get('lawn_sqft')}
 Current price: ${result.get('price')}
 Hardscape method: {result.get('hardscape_method')}
+
+Important formula used by the app after your response:
+final_lawn_sqft = parcel_sqft - GIS_building_sqft - estimated_hardscape_sqft
+
+So your estimated_hardscape_sqft is the key number.
 """
 
         payload = {
@@ -446,47 +450,63 @@ Hardscape method: {result.get('hardscape_method')}
         confidence = review.get("confidence", "low")
         notes = review.get("notes", "")
 
-        parcel_sqft = float(result.get("parcel_sqft", 0) or 0)
-        math_lawn_sqft = int(result.get("lawn_sqft", 0) or 0)
+        parcel_sqft = int(float(result.get("parcel_sqft", 0) or 0))
+        gis_building_sqft = int(float(result.get("building_sqft", 0) or 0))
+        original_lawn_sqft = int(result.get("lawn_sqft", 0) or 0)
+        original_price = int(result.get("price", 0) or 0)
 
-        ai_building_sqft = review.get("estimated_building_sqft")
-        ai_hardscape_sqft = review.get("estimated_hardscape_sqft")
-        ai_lawn_sqft = review.get("estimated_lawn_sqft")
+        ai_building_sqft_raw = review.get("estimated_building_sqft")
+        ai_hardscape_sqft_raw = review.get("estimated_hardscape_sqft")
 
-        # Validate and clamp values so a weird AI response cannot break pricing.
-        if ai_lawn_sqft is None:
-            raise ValueError("AI did not return estimated_lawn_sqft.")
+        if ai_hardscape_sqft_raw is None:
+            raise ValueError("AI did not return estimated_hardscape_sqft.")
 
-        ai_building_sqft = int(max(float(ai_building_sqft or 0), 0))
-        ai_hardscape_sqft = int(max(float(ai_hardscape_sqft or 0), 0))
-        ai_lawn_sqft = int(max(float(ai_lawn_sqft), 350))
+        ai_building_sqft = int(max(float(ai_building_sqft_raw or 0), 0))
+        ai_hardscape_sqft = int(max(float(ai_hardscape_sqft_raw), 0))
+
+        # Keep GIS building as the source of truth when available.
+        # If GIS building failed, fall back to AI's visual building estimate.
+        final_building_sqft = gis_building_sqft if gis_building_sqft > 0 else ai_building_sqft
 
         if parcel_sqft > 0:
-            ai_building_sqft = int(min(ai_building_sqft, parcel_sqft))
-            ai_hardscape_sqft = int(min(ai_hardscape_sqft, parcel_sqft))
-            ai_lawn_sqft = int(min(ai_lawn_sqft, parcel_sqft))
+            final_building_sqft = int(min(final_building_sqft, parcel_sqft))
+            max_possible_hardscape = max(parcel_sqft - final_building_sqft, 0)
+            ai_hardscape_sqft = int(min(ai_hardscape_sqft, max_possible_hardscape))
+
+        # This is the key corrected equation:
+        # final lawn = parcel - building - AI hardscape
+        final_lawn_sqft = int(parcel_sqft - final_building_sqft - ai_hardscape_sqft)
+
+        # Keep a small floor so pricing does not break if AI overestimates hardscape.
+        final_lawn_sqft = max(final_lawn_sqft, 350)
 
         adjusted_price = quote_price_for_service(
-            ai_lawn_sqft,
+            final_lawn_sqft,
             result["property_type"],
             result["service_type"],
             pricing_settings,
         )
 
+        notes = (
+            f"{notes} | Final lawn calculated by formula: "
+            f"{parcel_sqft} parcel - {final_building_sqft} building - "
+            f"{ai_hardscape_sqft} AI hardscape = {final_lawn_sqft} sqft."
+        )
+
         return {
-            "status": "AI measured",
+            "status": "AI hardscape measured",
             "confidence": confidence,
             "notes": notes,
             "ai_building_sqft": ai_building_sqft,
             "ai_hardscape_sqft": ai_hardscape_sqft,
-            "adjusted_lawn_sqft": ai_lawn_sqft,
+            "adjusted_lawn_sqft": final_lawn_sqft,
             "adjusted_price": adjusted_price,
         }
     except Exception as e:
         return {
             "status": "Math estimate",
             "confidence": "error",
-            "notes": f"AI measurement failed, so original math estimate was used: {e}",
+            "notes": f"AI hardscape measurement failed, so original math estimate was used: {e}",
             "ai_building_sqft": None,
             "ai_hardscape_sqft": None,
             "adjusted_lawn_sqft": int(result.get("lawn_sqft", 0) or 0),
@@ -1052,8 +1072,8 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
     result["ai_building_sqft"] = ai_review.get("ai_building_sqft", "")
     result["ai_hardscape_sqft"] = ai_review.get("ai_hardscape_sqft", "")
 
-    # In this test version, AI measurement can directly override the measured hardscape
-    # used for the final quote/export. The original values are still preserved in
+    # In this test version, AI hardscape measurement overrides the measured hardscape
+    # used for the final quote/export; final lawn is parcel - building - AI hardscape. The original values are still preserved in
     # original_lawn_sqft and original_price for comparison.
     if ai_review.get("ai_hardscape_sqft") is not None:
         result["hardscape_sqft"] = int(ai_review.get("ai_hardscape_sqft"))
@@ -1217,7 +1237,7 @@ if submitted:
 if st.session_state.result:
     r = st.session_state.result
 
-    status_label = "AI-measured estimate" if r.get("quote_status") == "AI measured" else "estimated price"
+    status_label = "AI hardscape estimate" if r.get("quote_status") == "AI hardscape measured" else "estimated price"
     st.markdown(
         f"""
         <div class="quote-card">
