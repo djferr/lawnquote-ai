@@ -7,3 +7,4 @@ pyproj
 shapely
 pandas
 urllib3
+openai
