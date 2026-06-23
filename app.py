@@ -21,19 +21,11 @@ try:
         save_quote_supabase,
         save_lead_supabase,
         get_pricing_settings_supabase,
-        save_pricing_settings_supabase,
-        get_quotes_supabase,
-        get_leads_supabase,
-        update_lead_status_supabase,
     )
 except Exception:
     save_quote_supabase = None
     save_lead_supabase = None
     get_pricing_settings_supabase = None
-    save_pricing_settings_supabase = None
-    get_quotes_supabase = None
-    get_leads_supabase = None
-    update_lead_status_supabase = None
 
 from PIL import Image, ImageDraw
 from pyproj import Transformer
@@ -1308,100 +1300,8 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
     return result
 
 
-# ----------------------------
-# Sidebar: hidden admin controls
-# ----------------------------
-with st.sidebar:
-    show_admin = st.checkbox("Show admin/export")
-
-    if show_admin:
-        st.subheader("Company settings")
-        st.caption("Phase 2B: tier pricing loads from Supabase. The local JSON file is kept as a backup.")
-        st.caption(f"Pricing source: {pricing_source}")
-
-        edited_pricing = json.loads(json.dumps(pricing_settings))
-
-        edited_pricing["company_name"] = st.text_input(
-            "Company name",
-            value=str(edited_pricing.get("company_name", "Lawn Company")),
-            key="company_name_setting",
-        )
-        edited_pricing["lead_notification_email"] = st.text_input(
-            "Lead notification email",
-            value=str(edited_pricing.get("lead_notification_email", "")),
-            key="lead_notification_email_setting",
-        )
-        edited_pricing["enable_ai_review"] = True
-        st.info("AI classification runs internally on every quote. Customer pricing is based on tiers, not exact sqft. If the API key is missing or fails, the app uses the base tier from GIS/math signals.")
-
-        st.subheader("Pricing tiers")
-        st.caption("Set the prices customers actually see. Most lawn companies quote in clean tiers like $45, $55, $65, $75.")
-
-        if "tier_prices" not in edited_pricing or not isinstance(edited_pricing.get("tier_prices"), dict):
-            edited_pricing["tier_prices"] = json.loads(json.dumps(DEFAULT_PRICING_SETTINGS["tier_prices"]))
-
-        for service_name in [
-            "Grass cutting",
-            "Seasonal cleanup",
-            "Fertilization and weed control",
-        ]:
-            if service_name not in edited_pricing["tier_prices"]:
-                edited_pricing["tier_prices"][service_name] = json.loads(
-                    json.dumps(DEFAULT_PRICING_SETTINGS["tier_prices"][service_name])
-                )
-
-            with st.expander(f"{service_name} tier prices", expanded=False):
-                for tier_name in ["Small", "Standard", "Large", "Complex", "Estate"]:
-                    edited_pricing["tier_prices"][service_name][tier_name] = st.number_input(
-                        f"{tier_name} price ($)",
-                        min_value=0.0,
-                        value=float(edited_pricing["tier_prices"][service_name].get(tier_name, 0)),
-                        step=5.0,
-                        key=f"{service_name}_{tier_name}_tier_price",
-                    )
-
-        with st.expander("Property multipliers", expanded=False):
-            edited_pricing["Residential"]["multiplier"] = st.number_input(
-                "Residential multiplier",
-                min_value=0.0,
-                value=float(edited_pricing["Residential"].get("multiplier", 1.0)),
-                step=0.05,
-                key="residential_multiplier",
-            )
-            edited_pricing["Commercial"]["multiplier"] = st.number_input(
-                "Commercial multiplier",
-                min_value=0.0,
-                value=float(edited_pricing["Commercial"].get("multiplier", 1.25)),
-                step=0.05,
-                key="commercial_multiplier",
-            )
-
-        col_save, col_reset = st.columns(2)
-        with col_save:
-            if st.button("Save pricing"):
-                save_pricing_settings(edited_pricing)  # local backup
-                if save_pricing_settings_supabase:
-                    try:
-                        save_pricing_settings_supabase(edited_pricing)
-                        st.success("Pricing saved to Supabase.")
-                    except Exception as e:
-                        st.warning(f"Pricing saved locally, but Supabase update failed: {e}")
-                else:
-                    st.success("Pricing saved locally. Supabase pricing helper is unavailable.")
-                st.rerun()
-
-        with col_reset:
-            if st.button("Reset defaults"):
-                save_pricing_settings(DEFAULT_PRICING_SETTINGS)  # local backup
-                if save_pricing_settings_supabase:
-                    try:
-                        save_pricing_settings_supabase(DEFAULT_PRICING_SETTINGS)
-                        st.success("Defaults restored in Supabase.")
-                    except Exception as e:
-                        st.warning(f"Defaults restored locally, but Supabase update failed: {e}")
-                else:
-                    st.success("Defaults restored locally. Supabase pricing helper is unavailable.")
-                st.rerun()
+# Admin controls moved to pages/1_Admin.py
+show_admin = False
 
 
 # ----------------------------
@@ -1524,121 +1424,3 @@ if st.session_state.result:
                     st.success("Request submitted. The company will follow up with you.")
                     if show_admin:
                         st.warning(f"Lead saved, but email was not sent: {email_message}")
-
-
-# ----------------------------
-# Admin/export area
-# ----------------------------
-if show_admin:
-    st.divider()
-    st.header("Admin / Export")
-
-    if st.session_state.result:
-        r_admin = st.session_state.result
-        st.markdown("### Current quote property report")
-        a, b, c = st.columns(3)
-        a.metric("Estimated Mowable Area", f"{int(r_admin.get('lawn_sqft', 0)):,} sqft")
-        b.metric("Final Tier", str(r_admin.get("pricing_tier", "")))
-        c.metric("Quote Confidence", f"{int(r_admin.get('quote_confidence_score', 0))}%")
-
-        d, e, f = st.columns(3)
-        d.metric("Parcel Size", f"{int(r_admin.get('parcel_sqft', 0)):,} sqft")
-        e.metric("Building Footprint", f"{int(r_admin.get('building_sqft', 0)):,} sqft")
-        f.metric("Hardscape Estimate", f"{int(r_admin.get('hardscape_sqft', 0)):,} sqft")
-
-        with st.expander("Internal tier reasoning", expanded=True):
-            st.write(f"**Address:** {r_admin.get('address', '')}")
-            st.write(f"**AI Class:** {r_admin.get('ai_property_class', '')}")
-            st.write(f"**AI Risk Level:** {r_admin.get('ai_risk_level', '')}")
-            st.write(f"**AI Notes:** {r_admin.get('ai_review_notes', '')}")
-            st.write(f"**Base Tier:** {r_admin.get('base_pricing_tier', '')}")
-            st.write(f"**Final Tier:** {r_admin.get('pricing_tier', '')}")
-            st.write(f"**Quote Status:** {r_admin.get('quote_status', '')}")
-            st.caption("Estimated mowable area is admin-only. Customer pricing is tier-based, not exact square-foot pricing.")
-
-    # Phase 2C: admin dashboard reads from Supabase first, with CSV fallback.
-    admin_data_source = "Supabase"
-    try:
-        if get_leads_supabase and get_quotes_supabase:
-            leads_df = pd.DataFrame(get_leads_supabase())
-            quotes_df = pd.DataFrame(get_quotes_supabase())
-        else:
-            raise RuntimeError("Supabase admin helpers unavailable.")
-    except Exception as e:
-        admin_data_source = "CSV fallback"
-        leads_df = read_csv_if_exists(LEADS_CSV)
-        quotes_df = read_csv_if_exists(QUOTES_CSV)
-        st.warning(f"Using CSV fallback for admin data: {e}")
-
-    st.caption(f"Admin data source: {admin_data_source}")
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Quotes", len(quotes_df))
-    col2.metric("Leads", len(leads_df))
-    conversion = (len(leads_df) / len(quotes_df) * 100) if len(quotes_df) else 0
-    col3.metric("Lead conversion", f"{conversion:.0f}%")
-
-    tabs = st.tabs(["Leads", "Quotes", "Pricing"])
-
-    with tabs[0]:
-        st.markdown("### Leads")
-        if leads_df.empty:
-            st.info("No leads submitted yet.")
-        else:
-            display_leads = leads_df.copy()
-            if "id" in display_leads.columns:
-                display_leads = display_leads.drop(columns=["id"])
-            st.dataframe(display_leads, use_container_width=True)
-
-            if admin_data_source == "Supabase" and "id" in leads_df.columns and update_lead_status_supabase:
-                with st.expander("Update lead status", expanded=False):
-                    lead_options = {}
-                    for _, row in leads_df.iterrows():
-                        label = f"{row.get('created_at', '')} | {row.get('customer_name', '')} | {row.get('address', '')} | {row.get('status', 'New')}"
-                        lead_options[label] = row.get("id")
-
-                    selected_label = st.selectbox("Lead", list(lead_options.keys()), key="lead_status_select")
-                    new_status = st.selectbox("New status", ["New", "Contacted", "Quoted", "Won", "Lost", "Archived"], key="lead_status_value")
-
-                    if st.button("Update selected lead"):
-                        try:
-                            update_lead_status_supabase(lead_options[selected_label], new_status)
-                            st.success("Lead status updated.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Could not update lead status: {e}")
-
-            st.download_button(
-                "Download leads CSV",
-                leads_df.to_csv(index=False),
-                file_name="leads.csv",
-                mime="text/csv",
-            )
-
-    with tabs[1]:
-        st.markdown("### Quotes + internal estimate details")
-        if quotes_df.empty:
-            st.info("No quotes generated yet.")
-        else:
-            st.dataframe(quotes_df, use_container_width=True)
-            st.download_button(
-                "Download quotes CSV",
-                quotes_df.to_csv(index=False),
-                file_name="quotes.csv",
-                mime="text/csv",
-            )
-
-    with tabs[2]:
-        st.markdown("### Pricing")
-        st.info("Pricing is edited in the sidebar under Show admin/export → Pricing tiers. Changes save to Supabase and the local JSON backup.")
-        pricing_rows = []
-        for service_name, tiers in pricing_settings.get("tier_prices", {}).items():
-            pricing_rows.append({
-                "service_name": service_name,
-                "Small": tiers.get("Small"),
-                "Standard": tiers.get("Standard"),
-                "Large": tiers.get("Large"),
-                "Complex": tiers.get("Complex"),
-                "Estate": tiers.get("Estate"),
-            })
-        st.dataframe(pd.DataFrame(pricing_rows), use_container_width=True)
