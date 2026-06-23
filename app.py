@@ -306,6 +306,7 @@ AI Property Class: {result.get('ai_property_class', '')}
 AI Risk Level: {result.get('ai_risk_level', '')}
 AI Adjustment Factor: {result.get('ai_adjustment_factor', '')}
 AI Review Notes: {result.get('ai_review_notes', '')}
+Quote Confidence Score: {result.get('quote_confidence_score', '')}%
 """
 
     msg = EmailMessage()
@@ -914,29 +915,66 @@ def max_tier(tier_a, tier_b):
 def base_tier_from_property(parcel_sqft, building_sqft, lawn_sqft, property_type):
     """Initial deterministic tier before AI classification.
 
-    Sqft is only an internal signal. The customer only sees the final tier price.
+    The estimated sqft is kept as an admin/internal signal, but the public quote is
+    driven by pricing tiers. This avoids pretending the app is an exact measuring
+    tape while still giving the company useful property intelligence.
     """
     parcel_sqft = float(parcel_sqft or 0)
-    building_sqft = float(building_sqft or 0)
-    lawn_sqft = float(lawn_sqft or 0)
     property_type = str(property_type or "Residential")
 
     if property_type == "Commercial":
         return "Complex"
 
-    if parcel_sqft > 20000:
-        return "Estate"
-
-    if lawn_sqft <= 2200:
+    # Base tier is mostly driven by overall parcel size, because that is the most
+    # reliable GIS signal. Pool/high-hardscape adjustments happen after AI review.
+    if parcel_sqft <= 4500:
         return "Small"
-    elif lawn_sqft <= 5000:
+    elif parcel_sqft <= 8500:
         return "Standard"
-    elif lawn_sqft <= 9000:
+    elif parcel_sqft <= 13000:
         return "Large"
-    elif lawn_sqft <= 14000:
+    elif parcel_sqft <= 20000:
         return "Complex"
     else:
         return "Estate"
+
+
+def quote_confidence_score(result):
+    """Internal confidence score for the admin/company view.
+
+    This is not a promise of exact square footage. It is a quick indicator of how
+    much supporting data the quote engine had available.
+    """
+    score = 95
+
+    if not result.get("building_data_used"):
+        score -= 15
+
+    if not result.get("satellite_hardscape_sqft"):
+        score -= 5
+
+    confidence = str(result.get("ai_review_confidence", "")).lower()
+    if confidence in ["low", "error", "none", ""]:
+        score -= 15
+    elif confidence == "medium":
+        score -= 7
+
+    risk = str(result.get("ai_risk_level", "")).lower()
+    if risk == "high":
+        score -= 15
+    elif risk == "medium":
+        score -= 8
+
+    property_class = str(result.get("ai_property_class", "")).lower()
+    if property_class == "tree_covered_or_unclear":
+        score -= 15
+    elif property_class in ["commercial_or_nonstandard", "estate_or_large_lot"]:
+        score -= 10
+
+    if result.get("review_reasons"):
+        score -= 8
+
+    return max(50, min(98, int(score)))
 
 
 def tier_from_ai_class(property_class, risk_level, current_tier):
@@ -1029,6 +1067,7 @@ def save_quote(result):
             "pricing_lawn_sqft": result.get("pricing_lawn_sqft", ""),
             "pricing_tier": result.get("pricing_tier", ""),
             "tier_pricing_sqft": result.get("tier_pricing_sqft", ""),
+            "quote_confidence_score": result.get("quote_confidence_score", ""),
         },
         [
             "timestamp",
@@ -1057,6 +1096,7 @@ def save_quote(result):
             "pricing_lawn_sqft",
             "pricing_tier",
             "tier_pricing_sqft",
+            "quote_confidence_score",
         ],
     )
 
@@ -1078,6 +1118,7 @@ def save_lead(name, phone, email, notes, result):
             "estimated_lawn_sqft": result["lawn_sqft"],
             "quote_status": result.get("quote_status", ""),
             "pricing_tier": result.get("pricing_tier", ""),
+            "quote_confidence_score": result.get("quote_confidence_score", ""),
             "status": "New",
         },
         [
@@ -1094,6 +1135,7 @@ def save_lead(name, phone, email, notes, result):
             "estimated_lawn_sqft",
             "quote_status",
             "pricing_tier",
+            "quote_confidence_score",
             "status",
         ],
     )
@@ -1227,6 +1269,8 @@ def calculate_quote(selected_address, property_type, service_type, pricing_setti
     # If the property is risky, keep that internal only.
     if result["ai_risk_level"] in ["medium", "high"] or result["review_reasons"]:
         result["quote_status"] = "Tier quote - confirmation recommended"
+
+    result["quote_confidence_score"] = quote_confidence_score(result)
 
     return result
 
@@ -1423,6 +1467,29 @@ if st.session_state.result:
 if show_admin:
     st.divider()
     st.header("Admin / Export")
+
+    if st.session_state.result:
+        r_admin = st.session_state.result
+        st.markdown("### Current quote property report")
+        a, b, c = st.columns(3)
+        a.metric("Estimated Mowable Area", f"{int(r_admin.get('lawn_sqft', 0)):,} sqft")
+        b.metric("Final Tier", str(r_admin.get("pricing_tier", "")))
+        c.metric("Quote Confidence", f"{int(r_admin.get('quote_confidence_score', 0))}%")
+
+        d, e, f = st.columns(3)
+        d.metric("Parcel Size", f"{int(r_admin.get('parcel_sqft', 0)):,} sqft")
+        e.metric("Building Footprint", f"{int(r_admin.get('building_sqft', 0)):,} sqft")
+        f.metric("Hardscape Estimate", f"{int(r_admin.get('hardscape_sqft', 0)):,} sqft")
+
+        with st.expander("Internal tier reasoning", expanded=True):
+            st.write(f"**Address:** {r_admin.get('address', '')}")
+            st.write(f"**AI Class:** {r_admin.get('ai_property_class', '')}")
+            st.write(f"**AI Risk Level:** {r_admin.get('ai_risk_level', '')}")
+            st.write(f"**AI Notes:** {r_admin.get('ai_review_notes', '')}")
+            st.write(f"**Base Tier:** {r_admin.get('base_pricing_tier', '')}")
+            st.write(f"**Final Tier:** {r_admin.get('pricing_tier', '')}")
+            st.write(f"**Quote Status:** {r_admin.get('quote_status', '')}")
+            st.caption("Estimated mowable area is admin-only. Customer pricing is tier-based, not exact square-foot pricing.")
 
     leads_df = read_csv_if_exists(LEADS_CSV)
     quotes_df = read_csv_if_exists(QUOTES_CSV)
