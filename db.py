@@ -183,3 +183,50 @@ def save_lead_supabase(customer_name, customer_phone, customer_email, customer_n
     }
 
     return supabase.table("leads").insert(row).execute()
+
+
+
+def get_quotes_supabase(limit=250):
+    """Return recent company quotes from Supabase."""
+    supabase = get_supabase_client()
+    company_id = get_company_id()
+
+    resp = (
+        supabase.table("quotes")
+        .select("created_at, quote_id, address, property_type, service_type, parcel_sqft, building_sqft, estimated_lawn_sqft, hardscape_sqft, ai_property_class, ai_risk_level, base_pricing_tier, pricing_tier, price")
+        .eq("company_id", company_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return resp.data or []
+
+
+def get_leads_supabase(limit=250):
+    """Return recent company leads from Supabase."""
+    supabase = get_supabase_client()
+    company_id = get_company_id()
+
+    resp = (
+        supabase.table("leads")
+        .select("id, created_at, quote_id, customer_name, customer_phone, customer_email, customer_notes, address, service_type, price, status")
+        .eq("company_id", company_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return resp.data or []
+
+
+def update_lead_status_supabase(lead_id, status):
+    """Update a lead status for the current company."""
+    supabase = get_supabase_client()
+    company_id = get_company_id()
+
+    return (
+        supabase.table("leads")
+        .update({"status": status})
+        .eq("id", lead_id)
+        .eq("company_id", company_id)
+        .execute()
+    )
