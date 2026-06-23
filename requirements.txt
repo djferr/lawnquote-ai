@@ -5,4 +5,5 @@ numpy
 pillow
 pyproj
 shapely
+pandas
 supabase
