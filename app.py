@@ -15,6 +15,13 @@ import pandas as pd
 import requests
 import streamlit as st
 import urllib3
+
+try:
+    from db import save_quote_supabase, save_lead_supabase
+except Exception:
+    save_quote_supabase = None
+    save_lead_supabase = None
+
 from PIL import Image, ImageDraw
 from pyproj import Transformer
 from shapely.geometry import shape
@@ -1416,6 +1423,14 @@ if submitted:
     st.session_state.result = result
     save_quote(result)
 
+    # Phase 2A: also save to Supabase, while keeping CSV as a safe fallback.
+    if save_quote_supabase:
+        try:
+            save_quote_supabase(result)
+        except Exception as e:
+            if show_admin:
+                st.warning(f"Quote saved locally, but Supabase quote save failed: {e}")
+
 
 if st.session_state.result:
     r = st.session_state.result
@@ -1444,6 +1459,15 @@ if st.session_state.result:
                 st.error("Please enter your name and phone number.")
             else:
                 save_lead(customer_name, customer_phone, customer_email, customer_notes, r)
+
+                # Phase 2A: also save to Supabase, while keeping CSV as a safe fallback.
+                if save_lead_supabase:
+                    try:
+                        save_lead_supabase(customer_name, customer_phone, customer_email, customer_notes, r)
+                    except Exception as e:
+                        if show_admin:
+                            st.warning(f"Lead saved locally, but Supabase lead save failed: {e}")
+
                 email_sent, email_message = send_lead_email(
                     pricing_settings,
                     customer_name,
