@@ -1,5 +1,15 @@
-from supabase import create_client
+import copy
 import streamlit as st
+from supabase import create_client
+
+
+TIER_COLUMNS = {
+    "Small": "small_price",
+    "Standard": "standard_price",
+    "Large": "large_price",
+    "Complex": "complex_price",
+    "Estate": "estate_price",
+}
 
 
 def _get_secret(name, default=None):
@@ -9,6 +19,7 @@ def _get_secret(name, default=None):
         return default
 
 
+@st.cache_resource
 def get_supabase_client():
     url = _get_secret("SUPABASE_URL")
     key = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
@@ -33,6 +44,101 @@ def _num(value):
         return float(value)
     except Exception:
         return None
+
+
+def _safe_price(value, fallback):
+    try:
+        if value is None or value == "":
+            return float(fallback)
+        return float(value)
+    except Exception:
+        return float(fallback)
+
+
+def get_pricing_settings_supabase(default_settings):
+    """Load company name and tier pricing from Supabase.
+
+    The app still passes DEFAULT_PRICING_SETTINGS so we can safely fall back for
+    missing services/tiers. Supabase is the source of truth for tier prices.
+    """
+    supabase = get_supabase_client()
+    company_id = get_company_id()
+    settings = copy.deepcopy(default_settings)
+
+    company_resp = (
+        supabase.table("companies")
+        .select("company_name")
+        .eq("id", company_id)
+        .limit(1)
+        .execute()
+    )
+    if company_resp.data:
+        settings["company_name"] = company_resp.data[0].get("company_name") or settings.get("company_name", "Lawn Company")
+
+    pricing_resp = (
+        supabase.table("pricing_tiers")
+        .select("service_name, small_price, standard_price, large_price, complex_price, estate_price")
+        .eq("company_id", company_id)
+        .execute()
+    )
+
+    if "tier_prices" not in settings or not isinstance(settings.get("tier_prices"), dict):
+        settings["tier_prices"] = {}
+
+    for row in pricing_resp.data or []:
+        service_name = row.get("service_name")
+        if not service_name:
+            continue
+
+        current = settings["tier_prices"].get(service_name, {})
+        settings["tier_prices"][service_name] = {
+            tier_name: _safe_price(row.get(column_name), current.get(tier_name, 0))
+            for tier_name, column_name in TIER_COLUMNS.items()
+        }
+
+    return settings
+
+
+def save_pricing_settings_supabase(settings):
+    """Save editable tier prices back to Supabase.
+
+    This updates existing rows when they exist and inserts a row if a service has
+    not been created yet. It avoids requiring a unique database constraint for
+    company_id + service_name.
+    """
+    supabase = get_supabase_client()
+    company_id = get_company_id()
+
+    company_name = str(settings.get("company_name", "Lawn Company")).strip() or "Lawn Company"
+    supabase.table("companies").update({"company_name": company_name}).eq("id", company_id).execute()
+
+    tier_prices = settings.get("tier_prices", {})
+    for service_name, tiers in tier_prices.items():
+        row = {
+            "company_id": company_id,
+            "service_name": service_name,
+            "small_price": _num(tiers.get("Small")) or 0,
+            "standard_price": _num(tiers.get("Standard")) or 0,
+            "large_price": _num(tiers.get("Large")) or 0,
+            "complex_price": _num(tiers.get("Complex")) or 0,
+            "estate_price": _num(tiers.get("Estate")) or 0,
+        }
+
+        existing = (
+            supabase.table("pricing_tiers")
+            .select("id")
+            .eq("company_id", company_id)
+            .eq("service_name", service_name)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            supabase.table("pricing_tiers").update(row).eq("id", existing.data[0]["id"]).execute()
+        else:
+            supabase.table("pricing_tiers").insert(row).execute()
+
+    return True
 
 
 def save_quote_supabase(result):
