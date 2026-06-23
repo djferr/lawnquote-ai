@@ -17,10 +17,17 @@ import streamlit as st
 import urllib3
 
 try:
-    from db import save_quote_supabase, save_lead_supabase
+    from db import (
+        save_quote_supabase,
+        save_lead_supabase,
+        get_pricing_settings_supabase,
+        save_pricing_settings_supabase,
+    )
 except Exception:
     save_quote_supabase = None
     save_lead_supabase = None
+    get_pricing_settings_supabase = None
+    save_pricing_settings_supabase = None
 
 from PIL import Image, ImageDraw
 from pyproj import Transformer
@@ -1163,7 +1170,20 @@ if "result" not in st.session_state:
 if "lead_submitted" not in st.session_state:
     st.session_state.lead_submitted = False
 
-pricing_settings = load_pricing_settings()
+local_pricing_settings = load_pricing_settings()
+pricing_settings = local_pricing_settings
+pricing_source = "Local JSON fallback"
+
+# Phase 2B: pricing now loads from Supabase when configured.
+# The local JSON remains as a backup so the app still runs if Supabase is unavailable.
+if get_pricing_settings_supabase:
+    try:
+        pricing_settings = get_pricing_settings_supabase(DEFAULT_PRICING_SETTINGS)
+        pricing_source = "Supabase"
+    except Exception as e:
+        pricing_settings = local_pricing_settings
+        pricing_source = f"Local JSON fallback - Supabase pricing load failed: {e}"
+
 
 
 # ----------------------------
@@ -1290,7 +1310,8 @@ with st.sidebar:
 
     if show_admin:
         st.subheader("Company settings")
-        st.caption("These settings save to pricing_settings.json and apply to future leads/quotes.")
+        st.caption("Phase 2B: tier pricing loads from Supabase. The local JSON file is kept as a backup.")
+        st.caption(f"Pricing source: {pricing_source}")
 
         edited_pricing = json.loads(json.dumps(pricing_settings))
 
@@ -1352,14 +1373,28 @@ with st.sidebar:
         col_save, col_reset = st.columns(2)
         with col_save:
             if st.button("Save pricing"):
-                save_pricing_settings(edited_pricing)
-                st.success("Pricing saved.")
+                save_pricing_settings(edited_pricing)  # local backup
+                if save_pricing_settings_supabase:
+                    try:
+                        save_pricing_settings_supabase(edited_pricing)
+                        st.success("Pricing saved to Supabase.")
+                    except Exception as e:
+                        st.warning(f"Pricing saved locally, but Supabase update failed: {e}")
+                else:
+                    st.success("Pricing saved locally. Supabase pricing helper is unavailable.")
                 st.rerun()
 
         with col_reset:
             if st.button("Reset defaults"):
-                save_pricing_settings(DEFAULT_PRICING_SETTINGS)
-                st.success("Defaults restored.")
+                save_pricing_settings(DEFAULT_PRICING_SETTINGS)  # local backup
+                if save_pricing_settings_supabase:
+                    try:
+                        save_pricing_settings_supabase(DEFAULT_PRICING_SETTINGS)
+                        st.success("Defaults restored in Supabase.")
+                    except Exception as e:
+                        st.warning(f"Defaults restored locally, but Supabase update failed: {e}")
+                else:
+                    st.success("Defaults restored locally. Supabase pricing helper is unavailable.")
                 st.rerun()
 
 
