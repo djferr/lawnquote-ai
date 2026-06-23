@@ -5,6 +5,4 @@ numpy
 pillow
 pyproj
 shapely
-geopandas
-fiona
 supabase
