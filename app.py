@@ -22,12 +22,18 @@ try:
         save_lead_supabase,
         get_pricing_settings_supabase,
         save_pricing_settings_supabase,
+        get_quotes_supabase,
+        get_leads_supabase,
+        update_lead_status_supabase,
     )
 except Exception:
     save_quote_supabase = None
     save_lead_supabase = None
     get_pricing_settings_supabase = None
     save_pricing_settings_supabase = None
+    get_quotes_supabase = None
+    get_leads_supabase = None
+    update_lead_status_supabase = None
 
 from PIL import Image, ImageDraw
 from pyproj import Transformer
@@ -1550,8 +1556,21 @@ if show_admin:
             st.write(f"**Quote Status:** {r_admin.get('quote_status', '')}")
             st.caption("Estimated mowable area is admin-only. Customer pricing is tier-based, not exact square-foot pricing.")
 
-    leads_df = read_csv_if_exists(LEADS_CSV)
-    quotes_df = read_csv_if_exists(QUOTES_CSV)
+    # Phase 2C: admin dashboard reads from Supabase first, with CSV fallback.
+    admin_data_source = "Supabase"
+    try:
+        if get_leads_supabase and get_quotes_supabase:
+            leads_df = pd.DataFrame(get_leads_supabase())
+            quotes_df = pd.DataFrame(get_quotes_supabase())
+        else:
+            raise RuntimeError("Supabase admin helpers unavailable.")
+    except Exception as e:
+        admin_data_source = "CSV fallback"
+        leads_df = read_csv_if_exists(LEADS_CSV)
+        quotes_df = read_csv_if_exists(QUOTES_CSV)
+        st.warning(f"Using CSV fallback for admin data: {e}")
+
+    st.caption(f"Admin data source: {admin_data_source}")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Quotes", len(quotes_df))
@@ -1559,26 +1578,67 @@ if show_admin:
     conversion = (len(leads_df) / len(quotes_df) * 100) if len(quotes_df) else 0
     col3.metric("Lead conversion", f"{conversion:.0f}%")
 
-    st.markdown("### Leads")
-    if leads_df.empty:
-        st.info("No leads submitted yet.")
-    else:
-        st.dataframe(leads_df, use_container_width=True)
-        st.download_button(
-            "Download leads CSV",
-            leads_df.to_csv(index=False),
-            file_name="leads.csv",
-            mime="text/csv",
-        )
+    tabs = st.tabs(["Leads", "Quotes", "Pricing"])
 
-    st.markdown("### Quotes + internal estimate details")
-    if quotes_df.empty:
-        st.info("No quotes generated yet.")
-    else:
-        st.dataframe(quotes_df, use_container_width=True)
-        st.download_button(
-            "Download quotes CSV",
-            quotes_df.to_csv(index=False),
-            file_name="quotes.csv",
-            mime="text/csv",
-        )
+    with tabs[0]:
+        st.markdown("### Leads")
+        if leads_df.empty:
+            st.info("No leads submitted yet.")
+        else:
+            display_leads = leads_df.copy()
+            if "id" in display_leads.columns:
+                display_leads = display_leads.drop(columns=["id"])
+            st.dataframe(display_leads, use_container_width=True)
+
+            if admin_data_source == "Supabase" and "id" in leads_df.columns and update_lead_status_supabase:
+                with st.expander("Update lead status", expanded=False):
+                    lead_options = {}
+                    for _, row in leads_df.iterrows():
+                        label = f"{row.get('created_at', '')} | {row.get('customer_name', '')} | {row.get('address', '')} | {row.get('status', 'New')}"
+                        lead_options[label] = row.get("id")
+
+                    selected_label = st.selectbox("Lead", list(lead_options.keys()), key="lead_status_select")
+                    new_status = st.selectbox("New status", ["New", "Contacted", "Quoted", "Won", "Lost", "Archived"], key="lead_status_value")
+
+                    if st.button("Update selected lead"):
+                        try:
+                            update_lead_status_supabase(lead_options[selected_label], new_status)
+                            st.success("Lead status updated.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not update lead status: {e}")
+
+            st.download_button(
+                "Download leads CSV",
+                leads_df.to_csv(index=False),
+                file_name="leads.csv",
+                mime="text/csv",
+            )
+
+    with tabs[1]:
+        st.markdown("### Quotes + internal estimate details")
+        if quotes_df.empty:
+            st.info("No quotes generated yet.")
+        else:
+            st.dataframe(quotes_df, use_container_width=True)
+            st.download_button(
+                "Download quotes CSV",
+                quotes_df.to_csv(index=False),
+                file_name="quotes.csv",
+                mime="text/csv",
+            )
+
+    with tabs[2]:
+        st.markdown("### Pricing")
+        st.info("Pricing is edited in the sidebar under Show admin/export → Pricing tiers. Changes save to Supabase and the local JSON backup.")
+        pricing_rows = []
+        for service_name, tiers in pricing_settings.get("tier_prices", {}).items():
+            pricing_rows.append({
+                "service_name": service_name,
+                "Small": tiers.get("Small"),
+                "Standard": tiers.get("Standard"),
+                "Large": tiers.get("Large"),
+                "Complex": tiers.get("Complex"),
+                "Estate": tiers.get("Estate"),
+            })
+        st.dataframe(pd.DataFrame(pricing_rows), use_container_width=True)
