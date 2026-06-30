@@ -30,11 +30,105 @@ def get_supabase_client():
     return create_client(url, key)
 
 
-def get_company_id():
-    company_id = _get_secret("COMPANY_ID")
+def get_default_company_slug():
+    """Default public company slug for local/dev use.
+
+    In production, the customer page can pass ?company=df-lawncare.
+    This fallback keeps the app working when no query parameter is present.
+    """
+    return (
+        _get_secret("DEFAULT_COMPANY_SLUG")
+        or _get_secret("COMPANY_SLUG")
+        or "df-lawncare"
+    )
+
+
+def get_company_by_slug(slug):
+    """Return one active/inactive company row by public slug."""
+    if not slug:
+        return None
+
+    supabase = get_supabase_client()
+    resp = (
+        supabase.table("companies")
+        .select("id, company_name, slug, lead_notification_email, phone, website, is_active")
+        .eq("slug", str(slug).strip().lower())
+        .limit(1)
+        .execute()
+    )
+    return resp.data[0] if resp.data else None
+
+
+def get_company_by_id(company_id):
+    """Return one company row by UUID."""
     if not company_id:
-        raise RuntimeError("Missing COMPANY_ID in Streamlit secrets.")
-    return company_id
+        return None
+
+    supabase = get_supabase_client()
+    resp = (
+        supabase.table("companies")
+        .select("id, company_name, slug, lead_notification_email, phone, website, is_active")
+        .eq("id", company_id)
+        .limit(1)
+        .execute()
+    )
+    return resp.data[0] if resp.data else None
+
+
+def set_active_company(company):
+    """Store the current company in Streamlit session state for this request/session."""
+    if not company or not company.get("id"):
+        return None
+
+    st.session_state["active_company"] = company
+    st.session_state["active_company_id"] = company["id"]
+    return company
+
+
+def get_active_company():
+    """Return the current company, falling back to COMPANY_ID for older admin flows."""
+    company = st.session_state.get("active_company")
+    if company and company.get("id"):
+        return company
+
+    fallback_company_id = _get_secret("COMPANY_ID")
+    if fallback_company_id:
+        company = get_company_by_id(fallback_company_id)
+        if company:
+            return set_active_company(company)
+
+    fallback_slug = get_default_company_slug()
+    if fallback_slug:
+        company = get_company_by_slug(fallback_slug)
+        if company:
+            return set_active_company(company)
+
+    return None
+
+
+def get_company_id(company_id=None):
+    """Return the active company id.
+
+    The optional company_id parameter lets the customer page explicitly pass the
+    company resolved from ?company=slug. Existing admin/database functions can
+    still call get_company_id() with no arguments.
+    """
+    if company_id:
+        return company_id
+
+    active_company_id = st.session_state.get("active_company_id")
+    if active_company_id:
+        return active_company_id
+
+    active_company = get_active_company()
+    if active_company and active_company.get("id"):
+        return active_company["id"]
+
+    secret_company_id = _get_secret("COMPANY_ID")
+    if secret_company_id:
+        return secret_company_id
+
+    raise RuntimeError("No active company found. Add ?company=df-lawncare or set COMPANY_ID in Streamlit secrets.")
 
 
 def _num(value):
@@ -55,25 +149,31 @@ def _safe_price(value, fallback):
         return float(fallback)
 
 
-def get_pricing_settings_supabase(default_settings):
+def get_pricing_settings_supabase(default_settings, company_id=None):
     """Load company name and tier pricing from Supabase.
 
     The app still passes DEFAULT_PRICING_SETTINGS so we can safely fall back for
     missing services/tiers. Supabase is the source of truth for tier prices.
     """
     supabase = get_supabase_client()
-    company_id = get_company_id()
+    company_id = get_company_id(company_id)
     settings = copy.deepcopy(default_settings)
 
     company_resp = (
         supabase.table("companies")
-        .select("company_name")
+        .select("company_name, lead_notification_email, phone, website, slug, is_active")
         .eq("id", company_id)
         .limit(1)
         .execute()
     )
     if company_resp.data:
-        settings["company_name"] = company_resp.data[0].get("company_name") or settings.get("company_name", "Lawn Company")
+        company = company_resp.data[0]
+        settings["company_name"] = company.get("company_name") or settings.get("company_name", "Lawn Company")
+        settings["lead_notification_email"] = company.get("lead_notification_email") or settings.get("lead_notification_email", "")
+        settings["company_slug"] = company.get("slug") or ""
+        settings["company_phone"] = company.get("phone") or ""
+        settings["company_website"] = company.get("website") or ""
+        settings["company_active"] = company.get("is_active")
 
     pricing_resp = (
         supabase.table("pricing_tiers")
@@ -99,7 +199,7 @@ def get_pricing_settings_supabase(default_settings):
     return settings
 
 
-def save_pricing_settings_supabase(settings):
+def save_pricing_settings_supabase(settings, company_id=None):
     """Save editable tier prices back to Supabase.
 
     This updates existing rows when they exist and inserts a row if a service has
@@ -107,7 +207,7 @@ def save_pricing_settings_supabase(settings):
     company_id + service_name.
     """
     supabase = get_supabase_client()
-    company_id = get_company_id()
+    company_id = get_company_id(company_id)
 
     company_name = str(settings.get("company_name", "Lawn Company")).strip() or "Lawn Company"
     supabase.table("companies").update({"company_name": company_name}).eq("id", company_id).execute()
@@ -141,9 +241,9 @@ def save_pricing_settings_supabase(settings):
     return True
 
 
-def save_quote_supabase(result):
+def save_quote_supabase(result, company_id=None):
     supabase = get_supabase_client()
-    company_id = get_company_id()
+    company_id = get_company_id(company_id)
 
     row = {
         "company_id": company_id,
@@ -165,9 +265,9 @@ def save_quote_supabase(result):
     return supabase.table("quotes").insert(row).execute()
 
 
-def save_lead_supabase(customer_name, customer_phone, customer_email, customer_notes, result):
+def save_lead_supabase(customer_name, customer_phone, customer_email, customer_notes, result, company_id=None):
     supabase = get_supabase_client()
-    company_id = get_company_id()
+    company_id = get_company_id(company_id)
 
     row = {
         "company_id": company_id,
@@ -186,10 +286,10 @@ def save_lead_supabase(customer_name, customer_phone, customer_email, customer_n
 
 
 
-def get_quotes_supabase(limit=250):
+def get_quotes_supabase(limit=250, company_id=None):
     """Return recent company quotes from Supabase."""
     supabase = get_supabase_client()
-    company_id = get_company_id()
+    company_id = get_company_id(company_id)
 
     resp = (
         supabase.table("quotes")
@@ -202,10 +302,10 @@ def get_quotes_supabase(limit=250):
     return resp.data or []
 
 
-def get_leads_supabase(limit=250):
+def get_leads_supabase(limit=250, company_id=None):
     """Return recent company leads from Supabase."""
     supabase = get_supabase_client()
-    company_id = get_company_id()
+    company_id = get_company_id(company_id)
 
     resp = (
         supabase.table("leads")
@@ -218,10 +318,10 @@ def get_leads_supabase(limit=250):
     return resp.data or []
 
 
-def update_lead_status_supabase(lead_id, status):
+def update_lead_status_supabase(lead_id, status, company_id=None):
     """Update a lead status for the current company."""
     supabase = get_supabase_client()
-    company_id = get_company_id()
+    company_id = get_company_id(company_id)
 
     return (
         supabase.table("leads")
