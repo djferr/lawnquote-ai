@@ -21,11 +21,17 @@ try:
         save_quote_supabase,
         save_lead_supabase,
         get_pricing_settings_supabase,
+        get_company_by_slug,
+        get_default_company_slug,
+        set_active_company,
     )
 except Exception:
     save_quote_supabase = None
     save_lead_supabase = None
     get_pricing_settings_supabase = None
+    get_company_by_slug = None
+    get_default_company_slug = None
+    set_active_company = None
 
 from PIL import Image, ImageDraw
 from pyproj import Transformer
@@ -265,6 +271,54 @@ def get_secret(name, default=None):
         return st.secrets.get(name, default)
     except Exception:
         return default
+
+
+def get_query_param(name, default=None):
+    """Safely read one Streamlit query parameter value."""
+    try:
+        value = st.query_params.get(name, default)
+        if isinstance(value, list):
+            return value[0] if value else default
+        return value if value not in [None, ""] else default
+    except Exception:
+        return default
+
+
+def resolve_active_company():
+    """Resolve the public company from ?company=slug and store it in session state.
+
+    For now, no query parameter falls back to DEFAULT_COMPANY_SLUG / COMPANY_SLUG /
+    df-lawncare. Later this same concept can map to custom domains or login.
+    """
+    if not get_company_by_slug:
+        return None, "Supabase company lookup is not available."
+
+    default_slug = "df-lawncare"
+    try:
+        if get_default_company_slug:
+            default_slug = get_default_company_slug() or default_slug
+    except Exception:
+        pass
+
+    slug = str(get_query_param("company", default_slug)).strip().lower()
+    if not slug:
+        slug = default_slug
+
+    try:
+        company = get_company_by_slug(slug)
+    except Exception as e:
+        return None, f"Could not load company '{slug}': {e}"
+
+    if not company:
+        return None, f"Company not found for slug '{slug}'."
+
+    if company.get("is_active") is False:
+        return None, f"Company '{slug}' is not active."
+
+    if set_active_company:
+        set_active_company(company)
+
+    return company, ""
 
 
 def send_lead_email(pricing_settings, customer_name, customer_phone, customer_email, customer_notes, result):
@@ -1168,15 +1222,28 @@ if "result" not in st.session_state:
 if "lead_submitted" not in st.session_state:
     st.session_state.lead_submitted = False
 
+active_company = None
+active_company_id = None
+company_load_error = ""
+
+if get_company_by_slug:
+    active_company, company_load_error = resolve_active_company()
+    if active_company:
+        active_company_id = active_company.get("id")
+
+if company_load_error:
+    st.error(company_load_error)
+    st.stop()
+
 local_pricing_settings = load_pricing_settings()
 pricing_settings = local_pricing_settings
 pricing_source = "Local JSON fallback"
 
-# Phase 2B: pricing now loads from Supabase when configured.
-# The local JSON remains as a backup so the app still runs if Supabase is unavailable.
+# Pricing loads from Supabase for the company resolved by ?company=slug.
+# Local JSON remains only as a development fallback if Supabase is unavailable.
 if get_pricing_settings_supabase:
     try:
-        pricing_settings = get_pricing_settings_supabase(DEFAULT_PRICING_SETTINGS)
+        pricing_settings = get_pricing_settings_supabase(DEFAULT_PRICING_SETTINGS, company_id=active_company_id)
         pricing_source = "Supabase"
     except Exception as e:
         pricing_settings = local_pricing_settings
@@ -1307,10 +1374,12 @@ show_admin = False
 # ----------------------------
 # Customer UI
 # ----------------------------
+company_display_name = pricing_settings.get("company_name", "Lawn Company")
+
 st.markdown(
-    """
+    f"""
     <div class="simple-header">
-        <h1>Instant Quote</h1>
+        <h1>{company_display_name} Instant Quote</h1>
         <p>Select a service, enter your address, and get an estimated price.</p>
     </div>
     """,
@@ -1367,7 +1436,7 @@ if submitted:
     # Phase 2A: also save to Supabase, while keeping CSV as a safe fallback.
     if save_quote_supabase:
         try:
-            save_quote_supabase(result)
+            save_quote_supabase(result, company_id=active_company_id)
         except Exception as e:
             if show_admin:
                 st.warning(f"Quote saved locally, but Supabase quote save failed: {e}")
@@ -1404,7 +1473,7 @@ if st.session_state.result:
                 # Phase 2A: also save to Supabase, while keeping CSV as a safe fallback.
                 if save_lead_supabase:
                     try:
-                        save_lead_supabase(customer_name, customer_phone, customer_email, customer_notes, r)
+                        save_lead_supabase(customer_name, customer_phone, customer_email, customer_notes, r, company_id=active_company_id)
                     except Exception as e:
                         if show_admin:
                             st.warning(f"Lead saved locally, but Supabase lead save failed: {e}")
